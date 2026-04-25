@@ -3,34 +3,38 @@ package log
 import (
 	"encoding/binary"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"os"
 	"path/filepath"
+	"time"
+
+	"github.com/berkaydemircin/broker/internal/protocol"
 )
 
 const (
 	/*	BatchHeaderSize is the fixed byte size of every batch header on disk.
 
-			Layout:
-			firstOffset     uint64   8 bytes  — absolute offset of first message
-		    batchLength     uint32   4 bytes  — byte length from byte 16 to end
-			crc             uint32   4 bytes  — crc32 of bytes 16 onward
-			attributes      uint16   2 bytes  — compression codec, flags
-			lastOffsetDelta uint32   4 bytes  — (lastOffset - firstOffset)
-			firstTimestamp  int64    8 bytes  — unix ms of earliest message
-			maxTimestamp    int64    8 bytes  — unix ms of latest message
+		Layout:
+		firstOffset     uint64   8 bytes  — absolute offset of first message
+		batchLength     uint32   4 bytes  — byte length from byte 16 to end
+		crc             uint32   4 bytes  — crc32 of bytes 16 onward
+		attributes      uint16   2 bytes  — compression codec, flags
+		lastOffsetDelta uint32   4 bytes  — (lastOffset - firstOffset)
+		firstTimestamp  int64    8 bytes  — unix ms of earliest message
+		maxTimestamp    int64    8 bytes  — unix ms of latest message
 	*/
 	BatchHeaderSize = 38
 
-	/* MessageHeaderSize is the fixed per message overhead within a batch.
+	/*	MessageHeaderSize is the fixed per message overhead within a batch.
 
-	Layout:
-	length        uint32   4 bytes  — byte length of everything after this
-	attributes    uint8    1 byte   — reserved, currently always 0. I read that Kafka has this, will explore later.
-	offsetDelta   uint32   4 bytes  — (thisOffset - batch.firstOffset)
-	timestamp     int64    8 bytes  — unix ms for this message
-	keyLength     uint32   4 bytes  — key byte length (max 4GB but this would be absurd)
-	valueLength   uint32   4 bytes  — value byte length (max 4GB)
+		Layout:
+		length        uint32   4 bytes  — byte length of everything after this
+		attributes    uint8    1 byte   — reserved, currently always 0. I read that Kafka has this, will explore later.
+		offsetDelta   uint32   4 bytes  — (thisOffset - batch.firstOffset)
+		timestamp     int64    8 bytes  — unix ms for this message
+		keyLength     uint32   4 bytes  — key byte length (max 4GB but this would be absurd, may lower this after researching)
+		valueLength   uint32   4 bytes  — value byte length (max 4GB)
 	*/
 	MessageHeaderSize = 25
 )
@@ -44,8 +48,7 @@ type Segment struct {
 }
 
 /*
- * Opens (if exists) or creates and returns a new segment at offset.
- * o.w. returns error and terminates. Does not return the existing file.
+ * Opens (if exists) or creates a new segment at offset and rebuilds its state in memory.
  */
 func NewSegment(dir string, baseOffset uint64, maxSize int64) (*Segment, error) {
 	path := filepath.Join(dir, fmt.Sprintf("%020d.log", baseOffset))
@@ -73,8 +76,8 @@ func NewSegment(dir string, baseOffset uint64, maxSize int64) (*Segment, error) 
 	return segment, nil
 }
 
-/* Recover from disk
- *
+/*
+ * Recover from disk to build nextoffset and size, called on each call of NewSegment.
  */
 func (segment *Segment) recover() error {
 	info, err := segment.file.Stat()
@@ -94,6 +97,7 @@ func (segment *Segment) recover() error {
 		n, err := segment.file.ReadAt(header, pos)
 		if err != nil {
 			if err == io.EOF || n < BatchHeaderSize {
+				// crashed mid writing the header
 				if err := segment.file.Truncate(pos); err != nil {
 					return fmt.Errorf("truncate partial header at %d: %w", pos, err)
 				}
@@ -105,22 +109,149 @@ func (segment *Segment) recover() error {
 
 		batchLength := binary.BigEndian.Uint32(header[8:12])
 		lastOffsetDelta := binary.BigEndian.Uint32(header[18:22])
-		batchEnd := pos + 16 + int64(batchLength)
+		batchEnd := pos + 16 + int64(batchLength) // +16 because the first 16 are the wireframe, not the actual batch content
 
 		if batchEnd > segment.currentSize {
+			// crashed mid writing the body
 			if err := segment.file.Truncate(pos); err != nil {
 				return fmt.Errorf("truncate partial batch at %d: %w", pos, err)
 			}
 			segment.currentSize = pos
 			break
 		}
+
 		segment.nextOffset += uint64(lastOffsetDelta) + 1
 		pos = batchEnd
 	}
 
 	if (segment.nextOffset == segment.baseOffset) && segment.currentSize > 0 {
-		return fmt.Errorf("corrupt segment: non empty file but no valid batches %w", err)
+		return fmt.Errorf("corrupt segment: non empty file but no valid batches")
 	}
 
 	return nil
+}
+
+func encodedBatchSize(batch *protocol.Batch) int {
+	size := BatchHeaderSize
+	for _, m := range batch.Messages {
+		size += MessageHeaderSize
+		size += len(m.Key)
+		size += len(m.Value)
+	}
+	return size
+}
+
+/*
+ * Serialized batch to on disk wire format
+ */
+func encodeBatch(batch *protocol.Batch) []byte {
+	totalSize := encodedBatchSize(batch)
+	buf := make([]byte, totalSize)
+
+	// batch header
+	content := buf[16:]
+	binary.BigEndian.PutUint16(content[0:2], batch.Attributes)
+	binary.BigEndian.PutUint32(content[2:6], batch.LastOffsetDelta)
+	binary.BigEndian.PutUint64(content[6:14], uint64(batch.FirstTimestamp.UnixMilli()))
+	binary.BigEndian.PutUint64(content[14:22], uint64(batch.MaxTimestamp.UnixMilli()))
+
+	// messages
+	cursor := 22
+	for i, msg := range batch.Messages {
+		msgStart := cursor
+
+		cursor += 4 // skipping length at first (check messageheadersize definition above)
+
+		content[cursor] = 0 // attributes
+		cursor++
+
+		binary.BigEndian.PutUint32(content[cursor:], uint32(i)) //offsetDelta
+		cursor += 4
+
+		binary.BigEndian.PutUint64(content[cursor:], uint64(msg.Timestamp.UnixMilli()))
+		cursor += 8
+
+		binary.BigEndian.PutUint32(content[cursor:], uint32(len(msg.Key)))
+		cursor += 4
+		copy(content[cursor:], msg.Key)
+		cursor += len(msg.Key)
+
+		binary.BigEndian.PutUint32(content[cursor:], uint32(len(msg.Value)))
+		cursor += 4
+		copy(content[cursor:], msg.Value)
+		cursor += len(msg.Value)
+
+		msgSize := cursor - msgStart
+		binary.BigEndian.PutUint32(content[msgStart:], uint32(msgSize))
+	}
+
+	binary.BigEndian.PutUint64(buf[0:8], batch.FirstOffset)
+	binary.BigEndian.PutUint32(buf[8:12], uint32(totalSize-16))
+	binary.BigEndian.PutUint32(buf[12:16], crc32.ChecksumIEEE(buf[16:]))
+
+	return buf
+}
+
+/*
+ * Deserializes batch body into protocol.Batch
+ */
+func decodeBatch(firstOffset uint64, body []byte) (*protocol.Batch, error) {
+
+	bodyLength := len(body)
+
+	if bodyLength < 22 {
+		return nil, fmt.Errorf("batch body is too short: %d, bytes", bodyLength)
+	}
+
+	batch := &protocol.Batch{FirstOffset: firstOffset}
+	batch.Attributes = binary.BigEndian.Uint16(body[0:2])
+	batch.LastOffsetDelta = binary.BigEndian.Uint32(body[2:6])
+	batch.FirstTimestamp = time.UnixMilli(int64(binary.BigEndian.Uint64(body[6:14])))
+	batch.MaxTimestamp = time.UnixMilli(int64(binary.BigEndian.Uint64(body[14:22])))
+
+	msgCount := int(batch.LastOffsetDelta) + 1
+	batch.Messages = make([]*protocol.Message, 0, msgCount)
+
+	cursor := 22
+	for i := 0; i < msgCount; i++ {
+		if cursor+4 > bodyLength {
+			return nil, fmt.Errorf("truncated length field for msg %d", i)
+		}
+
+		msgBodyLen := int(binary.BigEndian.Uint32(body[cursor:]))
+		cursor += 4
+
+		if cursor+msgBodyLen > bodyLength {
+			return nil, fmt.Errorf("message %d body truncated: need %d bytes, have %d", i, msgBodyLen, bodyLength-cursor)
+		}
+
+		message := &protocol.Message{}
+
+		// skipping attr and offset
+		cursor++
+		cursor += 4
+
+		message.Timestamp = time.UnixMilli(int64(binary.BigEndian.Uint64(body[cursor:])))
+		cursor += 8
+
+		keyLength := int32(binary.BigEndian.Uint32(body[cursor:]))
+		cursor += 4
+		if keyLength > 0 {
+			message.Key = make([]byte, keyLength)
+			copy(message.Key, body[cursor:cursor+int(keyLength)])
+			cursor += int(keyLength)
+		}
+
+		valueLength := int32(binary.BigEndian.Uint32(body[cursor:]))
+		cursor += 4
+		if valueLength > 0 {
+			message.Value = make([]byte, valueLength)
+			copy(message.Value, body[cursor:cursor+int(valueLength)])
+			cursor += int(valueLength)
+		}
+
+		batch.Messages = append(batch.Messages, message)
+	}
+
+	return batch, nil
 }
