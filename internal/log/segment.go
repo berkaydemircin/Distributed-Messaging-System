@@ -9,7 +9,7 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/berkaydemircin/broker/internal/protocol"
+	"github.com/berkaydemircin/Distributed-Messaging-System/internal/protocol"
 )
 
 const (
@@ -200,7 +200,7 @@ func decodeBatch(firstOffset uint64, body []byte) (*protocol.Batch, error) {
 	bodyLength := len(body)
 
 	if bodyLength < 22 {
-		return nil, fmt.Errorf("batch body is too short: %d, bytes", bodyLength)
+		return nil, fmt.Errorf("batch body is too short: %d bytes", bodyLength)
 	}
 
 	batch := &protocol.Batch{FirstOffset: firstOffset}
@@ -226,28 +226,48 @@ func decodeBatch(firstOffset uint64, body []byte) (*protocol.Batch, error) {
 		}
 
 		message := &protocol.Message{}
+		msgBodyStart := cursor
 
 		// skipping attr and offset
-		cursor++
-		cursor += 4
+		if cursor+5 > bodyLength {
+			return nil, fmt.Errorf("message %d header truncated", i)
+		}
+		cursor += 5
 
+		if cursor+8 > bodyLength {
+			return nil, fmt.Errorf("message %d timestamp truncated", i)
+		}
 		message.Timestamp = time.UnixMilli(int64(binary.BigEndian.Uint64(body[cursor:])))
 		cursor += 8
 
-		keyLength := int32(binary.BigEndian.Uint32(body[cursor:]))
+		keyLength := int(binary.BigEndian.Uint32(body[cursor:]))
 		cursor += 4
 		if keyLength > 0 {
+			if cursor+keyLength > bodyLength {
+				return nil, fmt.Errorf("message %d key truncated: need %d bytes, have %d",
+					i, keyLength, bodyLength-cursor)
+			}
 			message.Key = make([]byte, keyLength)
 			copy(message.Key, body[cursor:cursor+int(keyLength)])
 			cursor += int(keyLength)
 		}
 
-		valueLength := int32(binary.BigEndian.Uint32(body[cursor:]))
+		valueLength := int(binary.BigEndian.Uint32(body[cursor:]))
 		cursor += 4
 		if valueLength > 0 {
+			if cursor+valueLength > bodyLength {
+				return nil, fmt.Errorf("message %d value truncated: need %d bytes, have %d",
+					i, valueLength, bodyLength-cursor)
+			}
 			message.Value = make([]byte, valueLength)
 			copy(message.Value, body[cursor:cursor+int(valueLength)])
 			cursor += int(valueLength)
+		}
+
+		// is an end of decode sanity check size comparison good here? im not sure if its necessary
+		if cursor-msgBodyStart != msgBodyLen {
+			return nil, fmt.Errorf("message %d length mismatch: declared %d bytes, consumed %d",
+				i, msgBodyLen, cursor-msgBodyStart)
 		}
 
 		batch.Messages = append(batch.Messages, message)
