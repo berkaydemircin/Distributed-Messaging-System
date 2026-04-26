@@ -282,7 +282,7 @@ func decodeBatch(firstOffset uint64, body []byte) (*protocol.Batch, error) {
 	return batch, nil
 }
 
-func (segment *Segment) appendBatch(batch *protocol.Batch) (int64, error) {
+func (segment *Segment) AppendBatch(batch *protocol.Batch) (int64, error) {
 	totalSize := encodedBatchSize(batch)
 	if segment.currentSize+int64(totalSize) > segment.maxSize {
 		return 0, fmt.Errorf("segment full: size=%d totalSize=%d max=%d", segment.currentSize,

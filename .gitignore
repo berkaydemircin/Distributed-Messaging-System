@@ -30,3 +30,6 @@ go.work.sum
 # Editor/IDE
 .idea/
 .vscode/
+
+# not committing these for now, only used for internal verification/testing
+*test.go
