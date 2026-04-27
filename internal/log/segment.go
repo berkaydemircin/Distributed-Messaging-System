@@ -7,7 +7,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"time"
 
 	"github.com/berkaydemircin/Distributed-Messaging-System/internal/protocol"
 )
@@ -152,8 +151,8 @@ func encodeBatch(batch *protocol.Batch) []byte {
 	content := buf[16:]
 	binary.BigEndian.PutUint16(content[0:2], batch.Attributes)
 	binary.BigEndian.PutUint32(content[2:6], batch.LastOffsetDelta)
-	binary.BigEndian.PutUint64(content[6:14], uint64(batch.FirstTimestamp.UnixMilli()))
-	binary.BigEndian.PutUint64(content[14:22], uint64(batch.MaxTimestamp.UnixMilli()))
+	binary.BigEndian.PutUint64(content[6:14], uint64(batch.FirstTimestamp))
+	binary.BigEndian.PutUint64(content[14:22], uint64(batch.MaxTimestamp))
 
 	// messages
 	cursor := 22
@@ -168,7 +167,7 @@ func encodeBatch(batch *protocol.Batch) []byte {
 		binary.BigEndian.PutUint32(content[cursor:], uint32(i)) //offsetDelta
 		cursor += 4
 
-		binary.BigEndian.PutUint64(content[cursor:], uint64(msg.Timestamp.UnixMilli()))
+		binary.BigEndian.PutUint64(content[cursor:], uint64(msg.Timestamp))
 		cursor += 8
 
 		binary.BigEndian.PutUint32(content[cursor:], uint32(len(msg.Key)))
@@ -206,14 +205,14 @@ func decodeBatch(firstOffset uint64, body []byte) (*protocol.Batch, error) {
 	batch := &protocol.Batch{FirstOffset: firstOffset}
 	batch.Attributes = binary.BigEndian.Uint16(body[0:2])
 	batch.LastOffsetDelta = binary.BigEndian.Uint32(body[2:6])
-	batch.FirstTimestamp = time.UnixMilli(int64(binary.BigEndian.Uint64(body[6:14])))
-	batch.MaxTimestamp = time.UnixMilli(int64(binary.BigEndian.Uint64(body[14:22])))
+	batch.FirstTimestamp = int64(binary.BigEndian.Uint64(body[6:14]))
+	batch.MaxTimestamp = int64(binary.BigEndian.Uint64(body[14:22]))
 
 	msgCount := int(batch.LastOffsetDelta) + 1
-	batch.Messages = make([]*protocol.Message, 0, msgCount)
+	batch.Messages = make([]protocol.Message, msgCount)
 
 	cursor := 22
-	for i := 0; i < msgCount; i++ {
+	for i := range msgCount {
 		if cursor+4 > bodyLength {
 			return nil, fmt.Errorf("truncated length field for msg %d", i)
 		}
@@ -225,7 +224,7 @@ func decodeBatch(firstOffset uint64, body []byte) (*protocol.Batch, error) {
 			return nil, fmt.Errorf("message %d body truncated: need %d bytes, have %d", i, msgBodyLen, bodyLength-cursor)
 		}
 
-		message := &protocol.Message{}
+		message := &batch.Messages[i]
 		msgBodyStart := cursor
 
 		// skipping attr and offset
@@ -237,7 +236,7 @@ func decodeBatch(firstOffset uint64, body []byte) (*protocol.Batch, error) {
 		if cursor+8 > bodyLength {
 			return nil, fmt.Errorf("message %d timestamp truncated", i)
 		}
-		message.Timestamp = time.UnixMilli(int64(binary.BigEndian.Uint64(body[cursor:])))
+		message.Timestamp = int64(binary.BigEndian.Uint64(body[cursor:]))
 		cursor += 8
 
 		if cursor+4 > bodyLength {
@@ -250,9 +249,12 @@ func decodeBatch(firstOffset uint64, body []byte) (*protocol.Batch, error) {
 				return nil, fmt.Errorf("message %d key truncated: need %d bytes, have %d",
 					i, keyLength, bodyLength-cursor)
 			}
-			message.Key = make([]byte, keyLength)
+			/* message.Key = make([]byte, keyLength)
 			copy(message.Key, body[cursor:cursor+int(keyLength)])
-			cursor += int(keyLength)
+			cursor += int(keyLength) */
+			message.Key = body[cursor : cursor+keyLength : cursor+keyLength]
+			cursor += keyLength
+
 		}
 
 		if cursor+4 > bodyLength {
@@ -265,9 +267,11 @@ func decodeBatch(firstOffset uint64, body []byte) (*protocol.Batch, error) {
 				return nil, fmt.Errorf("message %d value truncated: need %d bytes, have %d",
 					i, valueLength, bodyLength-cursor)
 			}
-			message.Value = make([]byte, valueLength)
+			/* message.Value = make([]byte, valueLength)
 			copy(message.Value, body[cursor:cursor+int(valueLength)])
-			cursor += int(valueLength)
+			cursor += int(valueLength) */
+			message.Value = body[cursor : cursor+valueLength : cursor+valueLength]
+			cursor += valueLength
 		}
 
 		// is an end of decode sanity check size comparison good here? im not sure if its necessary
@@ -275,8 +279,6 @@ func decodeBatch(firstOffset uint64, body []byte) (*protocol.Batch, error) {
 			return nil, fmt.Errorf("message %d length mismatch: declared %d bytes, consumed %d",
 				i, msgBodyLen, cursor-msgBodyStart)
 		}
-
-		batch.Messages = append(batch.Messages, message)
 	}
 
 	return batch, nil
@@ -290,6 +292,9 @@ func (segment *Segment) AppendBatch(batch *protocol.Batch) (int64, error) {
 	}
 
 	batch.FirstOffset = segment.nextOffset
+	if len(batch.Messages) == 0 { // otherwise below may overflow
+		return 0, fmt.Errorf("empty batch")
+	}
 	batch.LastOffsetDelta = uint32(len(batch.Messages) - 1)
 
 	buf := encodeBatch(batch)
@@ -305,8 +310,8 @@ func (segment *Segment) AppendBatch(batch *protocol.Batch) (int64, error) {
 }
 
 func (segment *Segment) ReadBatchAt(pos int64) (*protocol.Batch, error) {
-	header := make([]byte, BatchHeaderSize)
-	if _, err := segment.file.ReadAt(header, pos); err != nil {
+	var header [BatchHeaderSize]byte
+	if _, err := segment.file.ReadAt(header[:], pos); err != nil {
 		return nil, fmt.Errorf("read batch header at %d: %w", pos, err)
 	}
 
