@@ -2,6 +2,7 @@ package log
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"hash/crc32"
 	"io"
@@ -10,6 +11,8 @@ import (
 
 	"github.com/berkaydemircin/Distributed-Messaging-System/internal/protocol"
 )
+
+var ErrSegmentFull = errors.New("segment full")
 
 const (
 	/*	BatchHeaderSize is the fixed byte size of every batch header on disk.
@@ -287,8 +290,7 @@ func decodeBatch(firstOffset uint64, body []byte) (*protocol.Batch, error) {
 func (segment *Segment) AppendBatch(batch *protocol.Batch) (int64, error) {
 	totalSize := encodedBatchSize(batch)
 	if segment.currentSize+int64(totalSize) > segment.maxSize {
-		return 0, fmt.Errorf("segment full: size=%d totalSize=%d max=%d", segment.currentSize,
-			totalSize, segment.maxSize)
+		return 0, ErrSegmentFull
 	}
 
 	batch.FirstOffset = segment.nextOffset
@@ -329,6 +331,18 @@ func (segment *Segment) ReadBatchAt(pos int64) (*protocol.Batch, error) {
 	}
 
 	return decodeBatch(firstOffset, body)
+}
+
+func (segment *Segment) ReadBatchMetaAt(pos int64) (firstOffset uint64, lastOffsetDelta uint32, onDiskSize int64, err error) {
+    var buf [22]byte
+    if _, err = segment.file.ReadAt(buf[:], pos); err != nil {
+        return 0, 0, 0, fmt.Errorf("read batch meta at %d: %w", pos, err)
+    }
+    firstOffset = binary.BigEndian.Uint64(buf[0:8])
+    batchLength := binary.BigEndian.Uint32(buf[8:12])
+    lastOffsetDelta = binary.BigEndian.Uint32(buf[18:22])
+    onDiskSize = 16 + int64(batchLength)
+    return firstOffset, lastOffsetDelta, onDiskSize, nil
 }
 
 func (segment *Segment) IsFull() bool       { return segment.currentSize >= segment.maxSize }

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"syscall"
 )
 
@@ -13,7 +14,7 @@ const (
 	indexEntrySize = 12
 
 	/*
-	 * preallocates 1MB per index file
+	 * preallocates 1 mb per index file
 	 * at 12 bytes per entry this holds ~87.381 entries.
 	 */
 	defaultIndexMaxBytes = 1024 * 1024
@@ -23,11 +24,11 @@ type Index struct {
 	file       *os.File
 	mmap       []byte
 	baseOffset uint64
-	size       int64 // bytes of mmap actually written, mmap[size:] is preallocated zeros len(mmap) returns the whole allocated length, not the used part
+	size       atomic.Int64 // bytes of mmap actually written; atomic for lock-free reads
 	maxBytes   int64
 }
 
-// NewIndex opens or creates the index file for the segment at baseOffset
+// Opens or creates the index file for the segment at baseOffset
 func NewIndex(dir string, baseOffset uint64, maxBytes int64) (*Index, error) {
 	if maxBytes == 0 {
 		maxBytes = defaultIndexMaxBytes
@@ -65,11 +66,11 @@ func NewIndex(dir string, baseOffset uint64, maxBytes int64) (*Index, error) {
 		maxBytes:   maxBytes,
 	}
 
-	idx.size = idx.recoverSize()
+	idx.size.Store(idx.recoverSize())
 	return idx, nil
 }
 
-// recoverSize scans the mmap to find where written entries end
+// scans the mmap to find where written entries end
 func (idx *Index) recoverSize() int64 {
 	var pos int64 = 0
 	for pos+indexEntrySize <= idx.maxBytes {
@@ -84,29 +85,27 @@ func (idx *Index) recoverSize() int64 {
 	return pos
 }
 
-/* Write appends one index entry mapping offset to filePos.
- * offset is the batch's absolute FirstOffset.
- * filePos is the byte position of the batch in the .log file.
- */
 func (idx *Index) Write(offset uint64, filePos int64) error {
 	if idx.IsFull() {
-		return fmt.Errorf("index full: size=%d maxBytes=%d", idx.size, idx.maxBytes)
+		return fmt.Errorf("index full: size=%d maxBytes=%d", idx.size.Load(), idx.maxBytes)
 	}
 
+	cur := idx.size.Load()
 	relOffset := uint32(offset - idx.baseOffset)
-	binary.BigEndian.PutUint32(idx.mmap[idx.size:idx.size+4], relOffset)
-	binary.BigEndian.PutUint64(idx.mmap[idx.size+4:idx.size+12], uint64(filePos))
+	binary.BigEndian.PutUint32(idx.mmap[cur:cur+4], relOffset)
+	binary.BigEndian.PutUint64(idx.mmap[cur+4:cur+12], uint64(filePos))
 
-	idx.size += indexEntrySize
+	idx.size.Add(indexEntrySize)
 	return nil
 }
 
-/* Lookup returns the file position of the batch whose FirstOffset is the largest indexed offset <= target
- * Returns 0 if the index is empty, meaning the caller should start reading from the beginning of the segment
- *
+/*
+ * Returns the file position of the batch whose firstOffset is the largest indexed offset <= target,
+ * 0 if the index is empty
  */
 func (idx *Index) Lookup(offset uint64) (int64, error) {
-	if idx.size == 0 {
+	curSize := idx.size.Load()
+	if curSize == 0 {
 		return 0, nil
 	}
 	if offset < idx.baseOffset {
@@ -115,7 +114,7 @@ func (idx *Index) Lookup(offset uint64) (int64, error) {
 	}
 
 	relTarget := uint32(offset - idx.baseOffset)
-	numEntries := int(idx.size / indexEntrySize)
+	numEntries := int(curSize / indexEntrySize)
 
 	low, high := 0, numEntries-1
 	result := 0
@@ -139,20 +138,19 @@ func (idx *Index) Lookup(offset uint64) (int64, error) {
 	return filePos, nil
 }
 
-// Close flushes unmaps, truncates, and closes the index file
 func (idx *Index) Close() error {
 	if err := syscall.Munmap(idx.mmap); err != nil {
 		return fmt.Errorf("munmap: %w", err)
 	}
 	idx.mmap = nil
 
-	if err := idx.file.Truncate(idx.size); err != nil {
+	if err := idx.file.Truncate(idx.size.Load()); err != nil {
 		return fmt.Errorf("truncate on close: %w", err)
 	}
 
 	return idx.file.Close()
 }
 
-func (idx *Index) IsFull() bool       { return idx.size+indexEntrySize > idx.maxBytes }
-func (idx *Index) Size() int64        { return idx.size }
+func (idx *Index) IsFull() bool       { return idx.size.Load()+indexEntrySize > idx.maxBytes }
+func (idx *Index) Size() int64        { return idx.size.Load() }
 func (idx *Index) BaseOffset() uint64 { return idx.baseOffset }
