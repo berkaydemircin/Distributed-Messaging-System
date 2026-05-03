@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 
 	"github.com/berkaydemircin/Distributed-Messaging-System/internal/protocol"
 )
@@ -32,11 +33,11 @@ const (
 
 		Layout:
 		length        uint32   4 bytes  — byte length of everything after this
-		attributes    uint8    1 byte   — reserved, currently always 0. I read that Kafka has this, will explore later.
+		attributes    uint8    1 byte   — reserved, currently always 0.
 		offsetDelta   uint32   4 bytes  — (thisOffset - batch.firstOffset)
 		timestamp     int64    8 bytes  — unix ms for this message
-		keyLength     uint32   4 bytes  — key byte length (max 4GB but this would be absurd, may lower this after researching)
-		valueLength   uint32   4 bytes  — value byte length (max 4GB)
+		keyLength     uint32   4 bytes  — key byte length
+		valueLength   uint32   4 bytes  — value byte length
 	*/
 	MessageHeaderSize = 25
 )
@@ -44,13 +45,14 @@ const (
 type Segment struct {
 	file        *os.File
 	baseOffset  uint64
-	nextOffset  uint64
-	currentSize int64
-	maxSize     int64 // kept as int instead of uint for compatibility with other methods
+	nextOffset  atomic.Uint64
+	currentSize atomic.Int64
+	maxSize     int64
 }
 
 /*
- * Opens (if exists) or creates a new segment at offset and rebuilds its state in memory.
+ * Opens (if exists) or creates a new segment at baseOffset and rebuilds its
+ * state in memory by scanning the file.
  */
 func NewSegment(dir string, baseOffset uint64, maxSize int64) (*Segment, error) {
 	path := filepath.Join(dir, fmt.Sprintf("%020d.log", baseOffset))
@@ -61,14 +63,13 @@ func NewSegment(dir string, baseOffset uint64, maxSize int64) (*Segment, error) 
 	}
 
 	segment := &Segment{
-		file:        file,
-		baseOffset:  baseOffset,
-		nextOffset:  baseOffset,
-		currentSize: 0,
-		maxSize:     maxSize,
+		file:    file,
+		baseOffset: baseOffset,
+		maxSize: maxSize,
 	}
+	segment.nextOffset.Store(baseOffset)
+	segment.currentSize.Store(0)
 
-	// handles if file already exists
 	if err := segment.recover(); err != nil {
 		file.Close()
 		return nil, fmt.Errorf("recover segment: %w", err)
@@ -78,24 +79,21 @@ func NewSegment(dir string, baseOffset uint64, maxSize int64) (*Segment, error) 
 	return segment, nil
 }
 
-/*
- * Recover from disk to build nextoffset and size, called on each call of NewSegment.
- */
 func (segment *Segment) recover() error {
 	info, err := segment.file.Stat()
 	if err != nil {
 		return err
 	}
 
-	segment.currentSize = info.Size()
-	if segment.currentSize == 0 {
+	fileSize := info.Size()
+	if fileSize == 0 {
 		return nil
 	}
 
-	var pos int64 = 0
+	var pos int64
 	header := make([]byte, BatchHeaderSize)
 
-	for pos < segment.currentSize {
+	for pos < fileSize {
 		n, err := segment.file.ReadAt(header, pos)
 		if err != nil {
 			if err == io.EOF || n < BatchHeaderSize {
@@ -103,7 +101,6 @@ func (segment *Segment) recover() error {
 				if err := segment.file.Truncate(pos); err != nil {
 					return fmt.Errorf("truncate partial header at %d: %w", pos, err)
 				}
-				segment.currentSize = pos
 				break
 			}
 			return fmt.Errorf("read header at %d: %w", pos, err)
@@ -111,23 +108,42 @@ func (segment *Segment) recover() error {
 
 		batchLength := binary.BigEndian.Uint32(header[8:12])
 		lastOffsetDelta := binary.BigEndian.Uint32(header[18:22])
-		batchEnd := pos + 16 + int64(batchLength) // +16 because the first 16 are the wireframe, not the actual batch content
+		batchEnd := pos + 16 + int64(batchLength)
 
-		if batchEnd > segment.currentSize {
-			// crashed mid writing the body
+		if batchEnd > fileSize {
 			if err := segment.file.Truncate(pos); err != nil {
 				return fmt.Errorf("truncate partial batch at %d: %w", pos, err)
 			}
-			segment.currentSize = pos
 			break
 		}
 
-		segment.nextOffset += uint64(lastOffsetDelta) + 1
+		body := make([]byte, batchLength)
+		if _, err := segment.file.ReadAt(body, pos+16); err != nil {
+			if err := segment.file.Truncate(pos); err != nil {
+				return fmt.Errorf("truncate unreadable body at %d: %w", pos, err)
+			}
+			break
+		}
+
+		storedCRC := binary.BigEndian.Uint32(header[12:16])
+		if crc32.ChecksumIEEE(body) != storedCRC {
+			if err := segment.file.Truncate(pos); err != nil {
+				return fmt.Errorf("truncate corrupt batch at %d: %w", pos, err)
+			}
+			break
+		}
+
+		// Batch is valid. Advance state and move to the next batch.
+		segment.nextOffset.Add(uint64(lastOffsetDelta) + 1)
 		pos = batchEnd
 	}
 
-	if (segment.nextOffset == segment.baseOffset) && segment.currentSize > 0 {
-		return fmt.Errorf("corrupt segment: non empty file but no valid batches")
+	// pos is now the byte offset of the first invalid/missing batch,
+	// which is the correct append position and the logical file size.
+	segment.currentSize.Store(pos)
+
+	if segment.nextOffset.Load() == segment.baseOffset && pos > 0 {
+		return fmt.Errorf("corrupt segment: non-empty file but no valid batches")
 	}
 
 	return nil
@@ -161,13 +177,12 @@ func encodeBatch(batch *protocol.Batch) []byte {
 	cursor := 22
 	for i, msg := range batch.Messages {
 		msgStart := cursor
-
-		cursor += 4 // skipping length at first (check messageheadersize definition above)
+		cursor += 4 // length placeholder
 
 		content[cursor] = 0 // attributes
 		cursor++
 
-		binary.BigEndian.PutUint32(content[cursor:], uint32(i)) //offsetDelta
+		binary.BigEndian.PutUint32(content[cursor:], uint32(i)) // offsetDelta
 		cursor += 4
 
 		binary.BigEndian.PutUint64(content[cursor:], uint64(msg.Timestamp))
@@ -183,8 +198,7 @@ func encodeBatch(batch *protocol.Batch) []byte {
 		copy(content[cursor:], msg.Value)
 		cursor += len(msg.Value)
 
-		msgLength := cursor - msgStart - 4
-		binary.BigEndian.PutUint32(content[msgStart:], uint32(msgLength))
+		binary.BigEndian.PutUint32(content[msgStart:], uint32(cursor-msgStart-4))
 	}
 
 	binary.BigEndian.PutUint64(buf[0:8], batch.FirstOffset)
@@ -195,7 +209,7 @@ func encodeBatch(batch *protocol.Batch) []byte {
 }
 
 /*
- * Deserializes batch body into protocol.Batch
+ * Deserializes a batch body (bytes after the first 16) into a protocol.Batch.
  */
 func decodeBatch(firstOffset uint64, body []byte) (*protocol.Batch, error) {
 
@@ -289,25 +303,26 @@ func decodeBatch(firstOffset uint64, body []byte) (*protocol.Batch, error) {
 
 func (segment *Segment) AppendBatch(batch *protocol.Batch) (int64, error) {
 	totalSize := encodedBatchSize(batch)
-	if segment.currentSize+int64(totalSize) > segment.maxSize {
+	if segment.currentSize.Load()+int64(totalSize) > segment.maxSize {
 		return 0, ErrSegmentFull
 	}
 
-	batch.FirstOffset = segment.nextOffset
-	if len(batch.Messages) == 0 { // otherwise below may overflow
+	if len(batch.Messages) == 0 {
 		return 0, fmt.Errorf("empty batch")
 	}
+
+	batch.FirstOffset = segment.nextOffset.Load()
 	batch.LastOffsetDelta = uint32(len(batch.Messages) - 1)
 
 	buf := encodeBatch(batch)
-	pos := segment.currentSize
+	pos := segment.currentSize.Load()
 
 	if _, err := segment.file.WriteAt(buf, pos); err != nil {
 		return 0, fmt.Errorf("write batch at pos %d: %w", pos, err)
 	}
 
-	segment.nextOffset += uint64(len(batch.Messages))
-	segment.currentSize += int64(len(buf))
+	segment.nextOffset.Add(uint64(len(batch.Messages)))
+	segment.currentSize.Add(int64(len(buf)))
 	return pos, nil
 }
 
@@ -334,27 +349,20 @@ func (segment *Segment) ReadBatchAt(pos int64) (*protocol.Batch, error) {
 }
 
 func (segment *Segment) ReadBatchMetaAt(pos int64) (firstOffset uint64, lastOffsetDelta uint32, onDiskSize int64, err error) {
-    var buf [22]byte
-    if _, err = segment.file.ReadAt(buf[:], pos); err != nil {
-        return 0, 0, 0, fmt.Errorf("read batch meta at %d: %w", pos, err)
-    }
-    firstOffset = binary.BigEndian.Uint64(buf[0:8])
-    batchLength := binary.BigEndian.Uint32(buf[8:12])
-    lastOffsetDelta = binary.BigEndian.Uint32(buf[18:22])
-    onDiskSize = 16 + int64(batchLength)
-    return firstOffset, lastOffsetDelta, onDiskSize, nil
+	var buf [22]byte
+	if _, err = segment.file.ReadAt(buf[:], pos); err != nil {
+		return 0, 0, 0, fmt.Errorf("read batch meta at %d: %w", pos, err)
+	}
+	firstOffset = binary.BigEndian.Uint64(buf[0:8])
+	batchLength := binary.BigEndian.Uint32(buf[8:12])
+	lastOffsetDelta = binary.BigEndian.Uint32(buf[18:22])
+	onDiskSize = 16 + int64(batchLength)
+	return firstOffset, lastOffsetDelta, onDiskSize, nil
 }
 
-func (segment *Segment) IsFull() bool       { return segment.currentSize >= segment.maxSize }
-func (segment *Segment) BaseOffset() uint64 { return segment.baseOffset }
-func (segment *Segment) NextOffset() uint64 { return segment.nextOffset }
-func (segment *Segment) Size() int64        { return segment.currentSize }
-
-// will probably be unused? will not use fsync for now
-func (segment *Segment) Sync() error {
-	return segment.file.Sync()
-}
-
-func (segment *Segment) Close() error {
-	return segment.file.Close()
-}
+func (segment *Segment) IsFull() bool        { return segment.currentSize.Load() >= segment.maxSize }
+func (segment *Segment) BaseOffset() uint64  { return segment.baseOffset }
+func (segment *Segment) NextOffset() uint64  { return segment.nextOffset.Load() }
+func (segment *Segment) Size() int64         { return segment.currentSize.Load() }
+func (segment *Segment) Sync() error         { return segment.file.Sync() }
+func (segment *Segment) Close() error        { return segment.file.Close() }

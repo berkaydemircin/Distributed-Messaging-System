@@ -140,7 +140,9 @@ func (l *Log) Append(batch *protocol.Batch) (uint64, error) {
 	active.bytesSinceIndex += batchBytes
 
 	if pos == 0 || active.bytesSinceIndex >= l.config.IndexIntervalBytes {
-		_ = active.index.Write(batch.FirstOffset, pos)
+		if err := active.index.Write(batch.FirstOffset, pos); err != nil {
+			return 0, fmt.Errorf("write index entry: %w", err)
+		}
 		active.bytesSinceIndex = 0
 	}
 
