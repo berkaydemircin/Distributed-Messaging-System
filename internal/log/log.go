@@ -261,7 +261,48 @@ func newSegmentPair(dir string, baseOffset uint64, config LogConfig) (*segmentPa
 		seg.Close()
 		return nil, fmt.Errorf("open index: %w", err)
 	}
-	return &segmentPair{segment: seg, index: idx}, nil
+
+	bytesSinceIndex, err := rebuildIndexFromSegment(seg, idx, config.IndexIntervalBytes)
+	if err != nil {
+		idx.Close()
+		seg.Close()
+		return nil, fmt.Errorf("rebuild index: %w", err)
+	}
+
+	return &segmentPair{segment: seg, index: idx, bytesSinceIndex: bytesSinceIndex}, nil
+}
+
+func rebuildIndexFromSegment(seg *Segment, idx *Index, indexIntervalBytes int64) (int64, error) {
+	idx.Reset()
+
+	var pos int64
+	var bytesSinceIndex int64
+	segSize := seg.Size()
+
+	for pos < segSize {
+		firstOffset, _, onDiskSize, err := seg.ReadBatchMetaAt(pos)
+		if err != nil {
+			return 0, fmt.Errorf("read batch meta at pos %d: %w", pos, err)
+		}
+		if onDiskSize <= 0 {
+			return 0, fmt.Errorf("invalid batch size %d at pos %d", onDiskSize, pos)
+		}
+		if pos+onDiskSize > segSize {
+			return 0, fmt.Errorf("batch at pos %d extends past segment size %d", pos, segSize)
+		}
+
+		bytesSinceIndex += onDiskSize
+		if pos == 0 || bytesSinceIndex >= indexIntervalBytes {
+			if err := idx.Write(firstOffset, pos); err != nil {
+				return 0, fmt.Errorf("write index entry at pos %d: %w", pos, err)
+			}
+			bytesSinceIndex = 0
+		}
+
+		pos += onDiskSize
+	}
+
+	return bytesSinceIndex, nil
 }
 
 /*

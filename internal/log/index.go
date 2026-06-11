@@ -41,6 +41,13 @@ func NewIndex(dir string, baseOffset uint64, maxBytes int64) (*Index, error) {
 		return nil, fmt.Errorf("open index %s: %w", path, err)
 	}
 
+	info, err := file.Stat()
+	if err != nil {
+		file.Close()
+		return nil, fmt.Errorf("stat index %s: %w", path, err)
+	}
+	originalSize := info.Size()
+
 	if err := file.Truncate(maxBytes); err != nil {
 		file.Close()
 		return nil, fmt.Errorf("pre-allocate index %s: %w", path, err)
@@ -66,9 +73,13 @@ func NewIndex(dir string, baseOffset uint64, maxBytes int64) (*Index, error) {
 		maxBytes:   maxBytes,
 	}
 
-	idx.size.Store(idx.recoverSize())
+	if originalSize > 0 {
+		idx.size.Store(idx.recoverSize())
+	}
 	return idx, nil
 }
+
+func (idx *Index) Reset() { idx.size.Store(0) }
 
 // scans the mmap to find where written entries end
 func (idx *Index) recoverSize() int64 {
