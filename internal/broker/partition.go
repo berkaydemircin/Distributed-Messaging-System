@@ -29,6 +29,7 @@ const (
 	ErrUnknownTopicOrPartition ErrorCode = 3
 	ErrNotLeaderOrFollower     ErrorCode = 6
 	ErrRequestTimedOut         ErrorCode = 7
+	ErrUnsupportedVersion      ErrorCode = 35
 	ErrStorageError            ErrorCode = 56
 )
 
@@ -72,8 +73,8 @@ type ISREntry struct {
 type purgatoryEntry struct {
 	requiredHW uint64
 	notify     chan struct{}
-	err        *ErrorCode 
-	index      int        // heap pos - will probably be removed later (the whole heap structure)
+	err        *ErrorCode
+	index      int // heap pos - will probably be removed later (the whole heap structure)
 }
 
 // purgatoryHeap is a min heap of *purgatoryEntry ordered by requiredHW
@@ -110,10 +111,10 @@ type Partition struct {
 
 	highWatermark atomic.Uint64
 	isLeader      atomic.Bool
-	leaderEpoch uint32
-	isr         []ISREntry // nil on followers only leader keeps track
-	isrMu       sync.RWMutex
-	appendMu sync.Mutex
+	leaderEpoch   uint32
+	isr           []ISREntry // nil on followers only leader keeps track
+	isrMu         sync.RWMutex
+	appendMu      sync.Mutex
 
 	purgatory   purgatoryHeap
 	purgatoryMu sync.Mutex
@@ -190,7 +191,7 @@ func (p *Partition) Append(ctx context.Context, batch *protocol.Batch, acks Acks
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	
+
 	p.appendMu.Lock()
 
 	// rechecking to prevent race conditions, this could probably be better implemented?
@@ -302,7 +303,8 @@ func (p *Partition) Fetch(fetchOffset uint64, followerBrokerID int32, isFollower
 	}
 
 	if isFollower {
-		p.updateFollowerLEO(followerBrokerID, fetchOffset)
+		fetchedUpTo := batch.FirstOffset + uint64(batch.LastOffsetDelta) + 1
+		p.updateFollowerLEO(followerBrokerID, fetchedUpTo)
 	}
 
 	return FetchResult{Batch: batch, HighWatermark: hw}, nil
