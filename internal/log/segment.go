@@ -14,32 +14,26 @@ import (
 )
 
 var ErrSegmentFull = errors.New("segment full")
+var crc32cTable = crc32.MakeTable(crc32.Castagnoli)
 
 const (
-	/*	BatchHeaderSize is the fixed byte size of every batch header on disk.
-
-		Layout:
-		firstOffset     uint64   8 bytes  — absolute offset of first message
-		batchLength     uint32   4 bytes  — byte length from byte 16 to end
-		crc             uint32   4 bytes  — crc32 of bytes 16 onward
-		attributes      uint16   2 bytes  — compression codec, flags
-		lastOffsetDelta uint32   4 bytes  — (lastOffset - firstOffset)
-		firstTimestamp  int64    8 bytes  — unix ms of earliest message
-		maxTimestamp    int64    8 bytes  — unix ms of latest message
-	*/
-	BatchHeaderSize = 38
-
-	/*	MessageHeaderSize is the fixed per message overhead within a batch.
-
-		Layout:
-		length        uint32   4 bytes  — byte length of everything after this
-		attributes    uint8    1 byte   — reserved, currently always 0.
-		offsetDelta   uint32   4 bytes  — (thisOffset - batch.firstOffset)
-		timestamp     int64    8 bytes  — unix ms for this message
-		keyLength     uint32   4 bytes  — key byte length
-		valueLength   uint32   4 bytes  — value byte length
-	*/
-	MessageHeaderSize = 25
+	// Layout (all big endian):
+	//   [0:8]   baseOffset              int64
+	//   [8:12]  batchLength             int32  - byte count from [12:end]
+	//   [12:16] partitionLeaderEpoch    int32  - written by broker on append
+	//   [16]    magic                   int8   = 2
+	//   [17:21] crc                     uint32 - CRC32C of bytes [21:end]
+	//   [21:23] attributes              int16
+	//   [23:27] lastOffsetDelta         int32
+	//   [27:35] firstTimestamp          int64
+	//   [35:43] maxTimestamp            int64
+	//   [43:51] producerId              int64  = −1 for non-transactional
+	//   [51:53] producerEpoch           int16  = −1
+	//   [53:57] baseSequence            int32  = −1
+	//   [57:61] recordCount             int32
+	//   [61:]   records
+	recordBatchOverhead = 61
+	recoverHeaderRead   = recordBatchOverhead
 )
 
 type Segment struct {
@@ -50,37 +44,28 @@ type Segment struct {
 	maxSize     int64
 }
 
-/*
- * Opens (if exists) or creates a new segment at baseOffset and rebuilds its
- * state in memory by scanning the file.
- */
+// NewSegment opens or creates the segment file at baseOffset and recovers
+// in-memory state by scanning existing data.
 func NewSegment(dir string, baseOffset uint64, maxSize int64) (*Segment, error) {
 	path := filepath.Join(dir, fmt.Sprintf("%020d.log", baseOffset))
-
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0644)
 	if err != nil {
-		return nil, fmt.Errorf("failed to open log file: %w", err)
+		return nil, fmt.Errorf("open log file: %w", err)
 	}
 
-	segment := &Segment{
-		file:    file,
-		baseOffset: baseOffset,
-		maxSize: maxSize,
-	}
-	segment.nextOffset.Store(baseOffset)
-	segment.currentSize.Store(0)
+	s := &Segment{file: file, baseOffset: baseOffset, maxSize: maxSize}
+	s.nextOffset.Store(baseOffset)
+	s.currentSize.Store(0)
 
-	if err := segment.recover(); err != nil {
+	if err := s.recover(); err != nil {
 		file.Close()
 		return nil, fmt.Errorf("recover segment: %w", err)
 	}
-
-	// file did not exist
-	return segment, nil
+	return s, nil
 }
 
-func (segment *Segment) recover() error {
-	info, err := segment.file.Stat()
+func (s *Segment) recover() error {
+	info, err := s.file.Stat()
 	if err != nil {
 		return err
 	}
@@ -90,15 +75,14 @@ func (segment *Segment) recover() error {
 		return nil
 	}
 
+	header := make([]byte, recoverHeaderRead)
 	var pos int64
-	header := make([]byte, BatchHeaderSize)
 
 	for pos < fileSize {
-		n, err := segment.file.ReadAt(header, pos)
+		n, err := s.file.ReadAt(header, pos)
 		if err != nil {
-			if err == io.EOF || n < BatchHeaderSize {
-				// crashed mid writing the header
-				if err := segment.file.Truncate(pos); err != nil {
+			if err == io.EOF || n < recoverHeaderRead {
+				if err := s.file.Truncate(pos); err != nil {
 					return fmt.Errorf("truncate partial header at %d: %w", pos, err)
 				}
 				break
@@ -106,263 +90,444 @@ func (segment *Segment) recover() error {
 			return fmt.Errorf("read header at %d: %w", pos, err)
 		}
 
-		batchLength := binary.BigEndian.Uint32(header[8:12])
-		lastOffsetDelta := binary.BigEndian.Uint32(header[18:22])
-		batchEnd := pos + 16 + int64(batchLength)
+		// batchLength covers bytes [12:end], so total = 12 + batchLength.
+		batchLength := int64(binary.BigEndian.Uint32(header[8:12]))
+		totalSize := 12 + batchLength
 
-		if batchEnd > fileSize {
-			if err := segment.file.Truncate(pos); err != nil {
+		if pos+totalSize > fileSize {
+			if err := s.file.Truncate(pos); err != nil {
 				return fmt.Errorf("truncate partial batch at %d: %w", pos, err)
 			}
 			break
 		}
 
-		body := make([]byte, batchLength)
-		if _, err := segment.file.ReadAt(body, pos+16); err != nil {
-			if err := segment.file.Truncate(pos); err != nil {
-				return fmt.Errorf("truncate unreadable body at %d: %w", pos, err)
+		// magic
+		if header[16] != 2 {
+			if err := s.file.Truncate(pos); err != nil {
+				return fmt.Errorf("truncate bad magic at %d: %w", pos, err)
 			}
 			break
 		}
 
-		storedCRC := binary.BigEndian.Uint32(header[12:16])
-		if crc32.ChecksumIEEE(body) != storedCRC {
-			if err := segment.file.Truncate(pos); err != nil {
+		// CRC32C covers bytes [21:totalSize] (from attributes to end)
+		storedCRC := binary.BigEndian.Uint32(header[17:21])
+		crcBody := make([]byte, totalSize-21)
+		if _, err := s.file.ReadAt(crcBody, pos+21); err != nil {
+			if err := s.file.Truncate(pos); err != nil {
+				return fmt.Errorf("truncate unreadable crc body at %d: %w", pos, err)
+			}
+			break
+		}
+		if crc32.Checksum(crcBody, crc32cTable) != storedCRC {
+			if err := s.file.Truncate(pos); err != nil {
 				return fmt.Errorf("truncate corrupt batch at %d: %w", pos, err)
 			}
 			break
 		}
 
-		// Batch is valid. Advance state and move to the next batch.
-		segment.nextOffset.Add(uint64(lastOffsetDelta) + 1)
-		pos = batchEnd
+		// lastOffsetDelta at [23:27]
+		lastOffsetDelta := binary.BigEndian.Uint32(header[23:27])
+		s.nextOffset.Add(uint64(lastOffsetDelta) + 1)
+		pos += totalSize
 	}
 
-	// pos is now the byte offset of the first invalid/missing batch,
-	// which is the correct append position and the logical file size.
-	segment.currentSize.Store(pos)
+	s.currentSize.Store(pos)
 
-	if segment.nextOffset.Load() == segment.baseOffset && pos > 0 {
+	if s.nextOffset.Load() == s.baseOffset && pos > 0 {
 		return fmt.Errorf("corrupt segment: non-empty file but no valid batches")
 	}
-
 	return nil
 }
 
-func encodedBatchSize(batch *protocol.Batch) int {
-	size := BatchHeaderSize
-	for _, m := range batch.Messages {
-		size += MessageHeaderSize
-		size += len(m.Key)
-		size += len(m.Value)
+// as a personal note, the concept of var size ints, zigzag encode and leb128 are genius
+func varintSize(v int64) int {
+	u := uint64((v << 1) ^ (v >> 63)) // zigzag encode
+	size := 1
+	for u >= 0x80 { // LEB128
+		u >>= 7
+		size++
 	}
 	return size
 }
 
-/*
- * Serialized batch to on disk wire format
- */
-func encodeBatch(batch *protocol.Batch) []byte {
-	totalSize := encodedBatchSize(batch)
-	buf := make([]byte, totalSize)
-
-	// batch header
-	content := buf[16:]
-	binary.BigEndian.PutUint16(content[0:2], batch.Attributes)
-	binary.BigEndian.PutUint32(content[2:6], batch.LastOffsetDelta)
-	binary.BigEndian.PutUint64(content[6:14], uint64(batch.FirstTimestamp))
-	binary.BigEndian.PutUint64(content[14:22], uint64(batch.MaxTimestamp))
-
-	// messages
-	cursor := 22
+func encodedBatchSize(batch *protocol.Batch) int {
+	total := recordBatchOverhead
 	for i, msg := range batch.Messages {
-		msgStart := cursor
-		cursor += 4 // length placeholder
+		tsDelta := msg.Timestamp - batch.FirstTimestamp
+		offsetDelta := int64(i)
+		bodySize := 1 + // attributes (int8)
+			varintSize(tsDelta) +
+			varintSize(offsetDelta) +
+			1 + len(msg.Key) // keyLen varint + key bytes, null is handled below
+		if msg.Key == nil {
+			bodySize = bodySize - 1 + varintSize(-1) // replace 1-byte assumption with actual -1 varint
+		} else {
+			bodySize += varintSize(int64(len(msg.Key))) - 1 // replace 1 byte assumption if msg is bigger
+		}
 
-		content[cursor] = 0 // attributes
-		cursor++
+		// value
+		if msg.Value == nil {
+			bodySize += varintSize(-1)
+		} else {
+			bodySize += varintSize(int64(len(msg.Value))) + len(msg.Value)
+		}
+		bodySize += 1 // headers count varint (0)
+		total += varintSize(int64(bodySize)) + bodySize
+	}
+	return total
+}
 
-		binary.BigEndian.PutUint32(content[cursor:], uint32(i)) // offsetDelta
-		cursor += 4
-
-		binary.BigEndian.PutUint64(content[cursor:], uint64(msg.Timestamp))
-		cursor += 8
-
-		binary.BigEndian.PutUint32(content[cursor:], uint32(len(msg.Key)))
-		cursor += 4
-		copy(content[cursor:], msg.Key)
-		cursor += len(msg.Key)
-
-		binary.BigEndian.PutUint32(content[cursor:], uint32(len(msg.Value)))
-		cursor += 4
-		copy(content[cursor:], msg.Value)
-		cursor += len(msg.Value)
-
-		binary.BigEndian.PutUint32(content[msgStart:], uint32(cursor-msgStart-4))
+func encodeBatch(batch *protocol.Batch, leaderEpoch int32) []byte {
+	recBuf := make([]byte, 0, len(batch.Messages)*64)
+	for i, msg := range batch.Messages {
+		recBuf = appendRecord(recBuf, &msg, int64(i), batch.FirstTimestamp)
 	}
 
-	binary.BigEndian.PutUint64(buf[0:8], batch.FirstOffset)
-	binary.BigEndian.PutUint32(buf[8:12], uint32(totalSize-16))
-	binary.BigEndian.PutUint32(buf[12:16], crc32.ChecksumIEEE(buf[16:]))
+	crcBodySize := (recordBatchOverhead - 21) + len(recBuf)
+	crcBody := make([]byte, 0, crcBodySize)
+
+	crcBody = binary.BigEndian.AppendUint16(crcBody, batch.Attributes)             // [21:23] attributes
+	crcBody = binary.BigEndian.AppendUint32(crcBody, batch.LastOffsetDelta)        // [23:27] lastOffsetDelta
+	crcBody = binary.BigEndian.AppendUint64(crcBody, uint64(batch.FirstTimestamp)) // [27:35] firstTimestamp
+	crcBody = binary.BigEndian.AppendUint64(crcBody, uint64(batch.MaxTimestamp))   // [35:43] maxTimestamp
+	crcBody = binary.BigEndian.AppendUint64(crcBody, uint64(0xFFFFFFFFFFFFFFFF))   // [43:51] producerId   = -1
+	crcBody = binary.BigEndian.AppendUint16(crcBody, 0xFFFF)                       // [51:53] producerEpoch = -1
+	crcBody = binary.BigEndian.AppendUint32(crcBody, 0xFFFFFFFF)                   // [53:57] baseSequence = -1
+	crcBody = binary.BigEndian.AppendUint32(crcBody, uint32(len(batch.Messages)))  // [57:61] recordCount
+	crcBody = append(crcBody, recBuf...)
+
+	checksum := crc32.Checksum(crcBody, crc32cTable)
+
+	// batchLength covers [12:end] = 4(epoch) + 1(magic) + 4(crc) + len(crcBody)
+	batchLength := 4 + 1 + 4 + len(crcBody)
+	totalSize := 12 + batchLength
+
+	buf := make([]byte, totalSize)
+	binary.BigEndian.PutUint64(buf[0:8], batch.FirstOffset)     // [0:8] baseOffset
+	binary.BigEndian.PutUint32(buf[8:12], uint32(batchLength))  // [8:12] batchLength
+	binary.BigEndian.PutUint32(buf[12:16], uint32(leaderEpoch)) // [12:16] partitionLeaderEpoch
+	buf[16] = 2                                                 // [16] magic = 2
+	binary.BigEndian.PutUint32(buf[17:21], checksum)            // [17:21] CRC32C
+	copy(buf[21:], crcBody)
 
 	return buf
 }
 
-/*
- * Deserializes a batch body (bytes after the first 16) into a protocol.Batch.
- */
-func decodeBatch(firstOffset uint64, body []byte) (*protocol.Batch, error) {
+func appendRecord(dst []byte, msg *protocol.Message, offsetDelta int64, baseTimestamp int64) []byte {
+	tsDelta := msg.Timestamp - baseTimestamp
 
-	bodyLength := len(body)
+	body := make([]byte, 0, 32+len(msg.Key)+len(msg.Value))
+	body = append(body, 0) // attribujtes
+	body = binary.AppendVarint(body, tsDelta)
+	body = binary.AppendVarint(body, offsetDelta)
 
-	if bodyLength < 22 {
-		return nil, fmt.Errorf("batch body is too short: %d bytes", bodyLength)
+	if msg.Key == nil {
+		body = binary.AppendVarint(body, -1)
+	} else {
+		body = binary.AppendVarint(body, int64(len(msg.Key)))
+		body = append(body, msg.Key...)
 	}
 
-	batch := &protocol.Batch{FirstOffset: firstOffset}
-	batch.Attributes = binary.BigEndian.Uint16(body[0:2])
-	batch.LastOffsetDelta = binary.BigEndian.Uint32(body[2:6])
-	batch.FirstTimestamp = int64(binary.BigEndian.Uint64(body[6:14]))
-	batch.MaxTimestamp = int64(binary.BigEndian.Uint64(body[14:22]))
+	if msg.Value == nil {
+		body = binary.AppendVarint(body, -1)
+	} else {
+		body = binary.AppendVarint(body, int64(len(msg.Value)))
+		body = append(body, msg.Value...)
+	}
 
-	msgCount := int(batch.LastOffsetDelta) + 1
-	batch.Messages = make([]protocol.Message, msgCount)
+	body = binary.AppendVarint(body, 0)
 
-	cursor := 22
-	for i := range msgCount {
-		if cursor+4 > bodyLength {
-			return nil, fmt.Errorf("truncated length field for msg %d", i)
+	dst = binary.AppendVarint(dst, int64(len(body)))
+	dst = append(dst, body...)
+	return dst
+}
+
+func decodeBatch(data []byte) (*protocol.Batch, error) {
+	if len(data) < recordBatchOverhead {
+		return nil, fmt.Errorf("decodeBatch: too short: %d bytes", len(data))
+	}
+
+	baseOffset := binary.BigEndian.Uint64(data[0:8])
+	batchLength := int64(binary.BigEndian.Uint32(data[8:12]))
+	totalSize := 12 + batchLength
+
+	if int64(len(data)) < totalSize {
+		return nil, fmt.Errorf("decodeBatch: data truncated: have %d, need %d", len(data), totalSize)
+	}
+
+	if data[16] != 2 {
+		return nil, fmt.Errorf("decodeBatch: unsupported magic %d", data[16])
+	}
+
+	// crc check crccheck
+	storedCRC := binary.BigEndian.Uint32(data[17:21])
+	if crc32.Checksum(data[21:totalSize], crc32cTable) != storedCRC {
+		return nil, fmt.Errorf("decodeBatch: CRC32C mismatch")
+	}
+
+	batch := &protocol.Batch{}
+	batch.FirstOffset = baseOffset
+	batch.Attributes = binary.BigEndian.Uint16(data[21:23])
+	batch.LastOffsetDelta = binary.BigEndian.Uint32(data[23:27])
+	batch.FirstTimestamp = int64(binary.BigEndian.Uint64(data[27:35]))
+	batch.MaxTimestamp = int64(binary.BigEndian.Uint64(data[35:43]))
+	// producerId [43:51], producerEpoch [51:53], baseSequence [53:57] - skip
+	recordCount := int(binary.BigEndian.Uint32(data[57:61]))
+
+	batch.Messages = make([]protocol.Message, recordCount)
+	pos := 61 // records start at byte 61
+
+	for i := range recordCount {
+		if pos >= int(totalSize) {
+			return nil, fmt.Errorf("decodeBatch: record %d: unexpected end of data", i)
 		}
 
-		msgBodyLen := int(binary.BigEndian.Uint32(body[cursor:]))
-		cursor += 4
+		recLen, n := binary.Varint(data[pos:])
+		if n <= 0 {
+			return nil, fmt.Errorf("decodeBatch: record %d: bad length varint", i)
+		}
+		pos += n
 
-		if cursor+msgBodyLen > bodyLength {
-			return nil, fmt.Errorf("message %d body truncated: need %d bytes, have %d", i, msgBodyLen, bodyLength-cursor)
+		if pos+int(recLen) > int(totalSize) {
+			return nil, fmt.Errorf("decodeBatch: record %d: length %d exceeds batch", i, recLen)
 		}
 
-		message := &batch.Messages[i]
-		msgBodyStart := cursor
-
-		// skipping attr and offset
-		if cursor+5 > bodyLength {
-			return nil, fmt.Errorf("message %d header truncated", i)
+		if pos >= int(totalSize) {
+			return nil, fmt.Errorf("decodeBatch: record %d: truncated attributes", i)
 		}
-		cursor += 5
+		pos++ // skip attributes
 
-		if cursor+8 > bodyLength {
-			return nil, fmt.Errorf("message %d timestamp truncated", i)
+		// timestampDelta
+		tsDelta, n := binary.Varint(data[pos:])
+		if n <= 0 {
+			return nil, fmt.Errorf("decodeBatch: record %d: bad timestampDelta varint", i)
 		}
-		message.Timestamp = int64(binary.BigEndian.Uint64(body[cursor:]))
-		cursor += 8
+		pos += n
 
-		if cursor+4 > bodyLength {
-			return nil, fmt.Errorf("message %d key length field truncated", i)
+		_, n = binary.Varint(data[pos:])
+		if n <= 0 {
+			return nil, fmt.Errorf("decodeBatch: record %d: bad offsetDelta varint", i)
 		}
-		keyLength := int(binary.BigEndian.Uint32(body[cursor:]))
-		cursor += 4
-		if keyLength > 0 {
-			if cursor+keyLength > bodyLength {
-				return nil, fmt.Errorf("message %d key truncated: need %d bytes, have %d",
-					i, keyLength, bodyLength-cursor)
+		pos += n
+
+		// key
+		keyLen, n := binary.Varint(data[pos:])
+		if n <= 0 {
+			return nil, fmt.Errorf("decodeBatch: record %d: bad keyLen varint", i)
+		}
+		pos += n
+		var key []byte
+		if keyLen >= 0 {
+			if pos+int(keyLen) > int(totalSize) {
+				return nil, fmt.Errorf("decodeBatch: record %d: key truncated", i)
 			}
-			/* message.Key = make([]byte, keyLength)
-			copy(message.Key, body[cursor:cursor+int(keyLength)])
-			cursor += int(keyLength) */
-			message.Key = body[cursor : cursor+keyLength : cursor+keyLength]
-			cursor += keyLength
-
+			key = data[pos : pos+int(keyLen) : pos+int(keyLen)]
+			pos += int(keyLen)
 		}
 
-		if cursor+4 > bodyLength {
-			return nil, fmt.Errorf("message %d value length field truncated", i)
+		// value
+		valLen, n := binary.Varint(data[pos:])
+		if n <= 0 {
+			return nil, fmt.Errorf("decodeBatch: record %d: bad valLen varint", i)
 		}
-		valueLength := int(binary.BigEndian.Uint32(body[cursor:]))
-		cursor += 4
-		if valueLength > 0 {
-			if cursor+valueLength > bodyLength {
-				return nil, fmt.Errorf("message %d value truncated: need %d bytes, have %d",
-					i, valueLength, bodyLength-cursor)
+		pos += n
+		var val []byte
+		if valLen >= 0 {
+			if pos+int(valLen) > int(totalSize) {
+				return nil, fmt.Errorf("decodeBatch: record %d: value truncated", i)
 			}
-			/* message.Value = make([]byte, valueLength)
-			copy(message.Value, body[cursor:cursor+int(valueLength)])
-			cursor += int(valueLength) */
-			message.Value = body[cursor : cursor+valueLength : cursor+valueLength]
-			cursor += valueLength
+			val = data[pos : pos+int(valLen) : pos+int(valLen)]
+			pos += int(valLen)
 		}
 
-		// is an end of decode sanity check size comparison good here? im not sure if its necessary
-		if cursor-msgBodyStart != msgBodyLen {
-			return nil, fmt.Errorf("message %d length mismatch: declared %d bytes, consumed %d",
-				i, msgBodyLen, cursor-msgBodyStart)
+		// headers count - skip headers
+		hdrCount, n := binary.Varint(data[pos:])
+		if n <= 0 {
+			return nil, fmt.Errorf("decodeBatch: record %d: bad headerCount varint", i)
+		}
+		pos += n
+		for h := int64(0); h < hdrCount; h++ {
+			hkLen, n := binary.Varint(data[pos:])
+			if n <= 0 {
+				return nil, fmt.Errorf("decodeBatch: record %d header %d: bad key len", i, h)
+			}
+			pos += n
+			if hkLen > 0 {
+				pos += int(hkLen)
+			}
+			hvLen, n := binary.Varint(data[pos:])
+			if n <= 0 {
+				return nil, fmt.Errorf("decodeBatch: record %d header %d: bad value len", i, h)
+			}
+			pos += n
+			if hvLen > 0 {
+				pos += int(hvLen)
+			}
+		}
+
+		batch.Messages[i] = protocol.Message{
+			Key:       key,
+			Value:     val,
+			Timestamp: batch.FirstTimestamp + tsDelta,
 		}
 	}
 
 	return batch, nil
 }
 
-func (segment *Segment) AppendBatch(batch *protocol.Batch) (int64, error) {
+func (s *Segment) AppendBatch(batch *protocol.Batch) (int64, error) {
+	if len(batch.Messages) == 0 {
+		return 0, fmt.Errorf("AppendBatch: empty batch")
+	}
+
 	totalSize := encodedBatchSize(batch)
-	if segment.currentSize.Load()+int64(totalSize) > segment.maxSize {
+	if s.currentSize.Load()+int64(totalSize) > s.maxSize {
 		return 0, ErrSegmentFull
 	}
 
-	if len(batch.Messages) == 0 {
-		return 0, fmt.Errorf("empty batch")
-	}
-
-	batch.FirstOffset = segment.nextOffset.Load()
+	batch.FirstOffset = s.nextOffset.Load()
 	batch.LastOffsetDelta = uint32(len(batch.Messages) - 1)
 
-	buf := encodeBatch(batch)
-	pos := segment.currentSize.Load()
+	// leaderEpoch = 0 for the internal path (no leader context)
+	buf := encodeBatch(batch, 0)
+	pos := s.currentSize.Load()
 
-	if _, err := segment.file.WriteAt(buf, pos); err != nil {
-		return 0, fmt.Errorf("write batch at pos %d: %w", pos, err)
+	if _, err := s.file.WriteAt(buf, pos); err != nil {
+		return 0, fmt.Errorf("AppendBatch: write at pos %d: %w", pos, err)
 	}
 
-	segment.nextOffset.Add(uint64(len(batch.Messages)))
-	segment.currentSize.Add(int64(len(buf)))
+	s.nextOffset.Add(uint64(len(batch.Messages)))
+	s.currentSize.Add(int64(len(buf)))
 	return pos, nil
 }
 
-func (segment *Segment) ReadBatchAt(pos int64) (*protocol.Batch, error) {
-	var header [BatchHeaderSize]byte
-	if _, err := segment.file.ReadAt(header[:], pos); err != nil {
-		return nil, fmt.Errorf("read batch header at %d: %w", pos, err)
+func (s *Segment) AppendRawBatch(data []byte, leaderEpoch int32) (baseOffset uint64, pos int64, lastOffsetDelta uint32, err error) {
+	if len(data) < recordBatchOverhead {
+		return 0, 0, 0, fmt.Errorf("AppendRawBatch: too short (%d bytes, need ≥%d)", len(data), recordBatchOverhead)
 	}
 
-	firstOffset := binary.BigEndian.Uint64(header[0:8])
-	batchLength := binary.BigEndian.Uint32(header[8:12])
-	storedCRC := binary.BigEndian.Uint32(header[12:16])
+	batchLength := int64(binary.BigEndian.Uint32(data[8:12]))
+	totalSize := 12 + batchLength
 
-	body := make([]byte, batchLength)
-	if _, err := segment.file.ReadAt(body, pos+16); err != nil {
-		return nil, fmt.Errorf("read batch body at %d: %w", pos+16, err)
+	if int64(len(data)) < totalSize {
+		return 0, 0, 0, fmt.Errorf("AppendRawBatch: declared batchLength=%d needs %d bytes, have %d",
+			batchLength, totalSize, len(data))
+	}
+	if int64(len(data)) != totalSize {
+		return 0, 0, 0, fmt.Errorf("AppendRawBatch: multiple RecordBatches in one records field are not supported: first batch needs %d bytes, have %d",
+			totalSize, len(data))
+	}
+	if data[16] != 2 {
+		return 0, 0, 0, fmt.Errorf("AppendRawBatch: unsupported magic %d", data[16])
 	}
 
-	if crc32.ChecksumIEEE(body) != storedCRC {
-		return nil, fmt.Errorf("crc mismatch at pos %d: batch corrupted", pos)
+	storedCRC := binary.BigEndian.Uint32(data[17:21])
+	if crc32.Checksum(data[21:totalSize], crc32cTable) != storedCRC {
+		return 0, 0, 0, fmt.Errorf("AppendRawBatch: CRC32C mismatch")
 	}
 
-	return decodeBatch(firstOffset, body)
+	pos = s.currentSize.Load()
+	if pos+totalSize > s.maxSize {
+		return 0, 0, 0, ErrSegmentFull
+	}
+
+	// TODO copying for now so i dont mutate the callers network buffer but take 2nd look
+	buf := make([]byte, totalSize)
+	copy(buf, data[:totalSize])
+
+	assignedOffset := s.nextOffset.Load()
+	binary.BigEndian.PutUint64(buf[0:8], assignedOffset)        // baseOffset - before CRC region
+	binary.BigEndian.PutUint32(buf[12:16], uint32(leaderEpoch)) // leaderEpoch - before CRC region
+
+	if _, err := s.file.WriteAt(buf, pos); err != nil {
+		return 0, 0, 0, fmt.Errorf("AppendRawBatch: write at pos %d: %w", pos, err)
+	}
+
+	lod := binary.BigEndian.Uint32(buf[23:27])
+	s.nextOffset.Add(uint64(lod) + 1)
+	s.currentSize.Add(totalSize)
+
+	return assignedOffset, pos, lod, nil
 }
 
-func (segment *Segment) ReadBatchMetaAt(pos int64) (firstOffset uint64, lastOffsetDelta uint32, onDiskSize int64, err error) {
-	var buf [22]byte
-	if _, err = segment.file.ReadAt(buf[:], pos); err != nil {
-		return 0, 0, 0, fmt.Errorf("read batch meta at %d: %w", pos, err)
+// used by internal/test read path
+func (s *Segment) ReadBatchAt(pos int64) (*protocol.Batch, error) {
+	var prefix [12]byte
+	if _, err := s.file.ReadAt(prefix[:], pos); err != nil {
+		return nil, fmt.Errorf("ReadBatchAt: read prefix at %d: %w", pos, err)
+	}
+	batchLength := int64(binary.BigEndian.Uint32(prefix[8:12]))
+	totalSize := 12 + batchLength
+
+	buf := make([]byte, totalSize)
+	if _, err := s.file.ReadAt(buf, pos); err != nil {
+		return nil, fmt.Errorf("ReadBatchAt: read batch at %d: %w", pos, err)
+	}
+	return decodeBatch(buf)
+}
+
+func (s *Segment) ReadBatchMetaAt(pos int64) (firstOffset uint64, lastOffsetDelta uint32, onDiskSize int64, err error) {
+	var buf [27]byte
+	if _, err = s.file.ReadAt(buf[:], pos); err != nil {
+		return 0, 0, 0, fmt.Errorf("ReadBatchMetaAt: read at %d: %w", pos, err)
 	}
 	firstOffset = binary.BigEndian.Uint64(buf[0:8])
-	batchLength := binary.BigEndian.Uint32(buf[8:12])
-	lastOffsetDelta = binary.BigEndian.Uint32(buf[18:22])
-	onDiskSize = 16 + int64(batchLength)
+	batchLength := int64(binary.BigEndian.Uint32(buf[8:12]))
+	lastOffsetDelta = binary.BigEndian.Uint32(buf[23:27])
+	onDiskSize = 12 + batchLength // batchLength covers [12:end]
 	return firstOffset, lastOffsetDelta, onDiskSize, nil
 }
 
-func (segment *Segment) IsFull() bool        { return segment.currentSize.Load() >= segment.maxSize }
-func (segment *Segment) BaseOffset() uint64  { return segment.baseOffset }
-func (segment *Segment) NextOffset() uint64  { return segment.nextOffset.Load() }
-func (segment *Segment) Size() int64         { return segment.currentSize.Load() }
-func (segment *Segment) Sync() error         { return segment.file.Sync() }
-func (segment *Segment) Close() error        { return segment.file.Close() }
+func (s *Segment) ReadRawBatchAt(pos int64, maxBytes int32) ([]byte, uint64, error) {
+	segSize := s.currentSize.Load()
+	if pos >= segSize {
+		return nil, 0, fmt.Errorf("ReadRawBatchAt: pos %d at or beyond segment size %d", pos, segSize)
+	}
+
+	var result []byte
+	var fetchedUpTo uint64
+	remaining := int64(maxBytes)
+	first := true
+
+	for pos < segSize {
+		firstOffset, lastOffsetDelta, totalSize, err := s.ReadBatchMetaAt(pos)
+		if err != nil {
+			return nil, 0, fmt.Errorf("ReadRawBatchAt: read meta at pos %d: %w", pos, err)
+		}
+
+		if pos+totalSize > segSize {
+			break // partial write at segment tail
+		}
+		if !first && totalSize > remaining {
+			break // budget exhausted
+		}
+
+		buf := make([]byte, totalSize)
+		if _, err := s.file.ReadAt(buf, pos); err != nil {
+			return nil, 0, fmt.Errorf("ReadRawBatchAt: read batch at pos %d: %w", pos, err)
+		}
+		result = append(result, buf...)
+		fetchedUpTo = firstOffset + uint64(lastOffsetDelta) + 1
+
+		remaining -= totalSize
+		pos += totalSize
+		first = false
+
+		if remaining <= 0 {
+			break
+		}
+	}
+
+	if len(result) == 0 {
+		return nil, 0, fmt.Errorf("ReadRawBatchAt: no complete batch at pos %d", pos)
+	}
+
+	return result, fetchedUpTo, nil
+}
+
+func (s *Segment) IsFull() bool       { return s.currentSize.Load() >= s.maxSize }
+func (s *Segment) BaseOffset() uint64 { return s.baseOffset }
+func (s *Segment) NextOffset() uint64 { return s.nextOffset.Load() }
+func (s *Segment) Size() int64        { return s.currentSize.Load() }
+func (s *Segment) Sync() error        { return s.file.Sync() }
+func (s *Segment) Close() error       { return s.file.Close() }
