@@ -71,6 +71,10 @@ func (tm *TopicManager) recoverFromDisk() error {
 			continue
 		}
 		topicName := name[:idx]
+		if err := validateTopicName(topicName); err != nil {
+			continue
+		}
+
 		partID, err := strconv.Atoi(name[idx+1:])
 		if err != nil || partID < 0 {
 			continue
