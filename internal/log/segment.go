@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync/atomic"
 
 	"github.com/berkaydemircin/Distributed-Messaging-System/internal/protocol"
@@ -487,6 +488,14 @@ func (s *Segment) ReadRawBatchAt(pos int64, maxBytes int32) ([]byte, uint64, err
 	var result []byte
 	var fetchedUpTo uint64
 	remaining := int64(maxBytes)
+
+	if remaining > 0 {
+		capHint := min(segSize-pos, remaining)
+		if capHint > 0 {
+			result = make([]byte, 0, int(capHint))
+		}
+	}
+
 	first := true
 
 	for pos < segSize {
@@ -502,11 +511,15 @@ func (s *Segment) ReadRawBatchAt(pos int64, maxBytes int32) ([]byte, uint64, err
 			break // budget exhausted
 		}
 
-		buf := make([]byte, totalSize)
-		if _, err := s.file.ReadAt(buf, pos); err != nil {
+		n := int(totalSize)
+		result = slices.Grow(result, n)
+
+		start := len(result)
+		result = result[:start+n]
+
+		if _, err := s.file.ReadAt(result[start:start+n], pos); err != nil {
 			return nil, 0, fmt.Errorf("ReadRawBatchAt: read batch at pos %d: %w", pos, err)
 		}
-		result = append(result, buf...)
 		fetchedUpTo = firstOffset + uint64(lastOffsetDelta) + 1
 
 		remaining -= totalSize

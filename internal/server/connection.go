@@ -107,7 +107,6 @@ func (c *clientConn) readMessage() ([]byte, error) {
 func (c *clientConn) writeResponse(reqHeader protocol.RequestHeader, body []byte) error {
 	respHeaderVersion := protocol.ResponseHeaderVersion(reqHeader.APIKey, reqHeader.APIVersion)
 
-	// Build the full response payload (header + body)
 	headerSize := 4 // correlation_id
 	if respHeaderVersion >= 1 {
 		headerSize += 1 // tagged_fields (just uvarint 0 = 1 byte)
@@ -115,31 +114,30 @@ func (c *clientConn) writeResponse(reqHeader protocol.RequestHeader, body []byte
 
 	totalSize := headerSize + len(body)
 
-	// Write message_size prefix
-	var sizeBuf [4]byte
-	binary.BigEndian.PutUint32(sizeBuf[:], uint32(totalSize))
-	if _, err := c.writer.Write(sizeBuf[:]); err != nil {
-		return err
+	var prefix [9]byte // size(4) + correlation_id(4) + opt tagged_fields(1)
+	binary.BigEndian.PutUint32(prefix[0:4], uint32(totalSize))
+	binary.BigEndian.PutUint32(prefix[4:8], uint32(reqHeader.CorrelationID))
+
+	prefixLen := 8
+	if respHeaderVersion >= 1 {
+		prefix[8] = 0
+		prefixLen = 9
 	}
 
-	// Write response header
-	var corrBuf [4]byte
-	binary.BigEndian.PutUint32(corrBuf[:], uint32(reqHeader.CorrelationID))
-	if _, err := c.writer.Write(corrBuf[:]); err != nil {
-		return err
-	}
-	if respHeaderVersion >= 1 {
-		if _, err := c.writer.Write([]byte{0}); err != nil { // empty tagged fields
+	// flush before writing
+	if c.writer.Buffered() > 0 {
+		if err := c.writer.Flush(); err != nil {
 			return err
 		}
 	}
 
-	// Write body
-	if _, err := c.writer.Write(body); err != nil {
-		return err
+	buffers := net.Buffers{prefix[:prefixLen]}
+	if len(body) > 0 {
+		buffers = append(buffers, body)
 	}
 
-	return c.writer.Flush()
+	_, err := buffers.WriteTo(c.conn)
+	return err
 }
 
 func isNormalClose(err error) bool {
