@@ -4,12 +4,22 @@ import (
 	"container/heap"
 	"context"
 	"fmt"
+
+	storagelog "github.com/berkaydemircin/Distributed-Messaging-System/internal/log"
 )
 
 type FetchRawResult struct {
 	// nil when there is no data on requested offset **
 	Records []byte
 
+	HighWatermark  uint64
+	LogStartOffset uint64
+	FetchedUpTo    uint64
+}
+
+type FetchRawRangeResult struct {
+	Ranges         []storagelog.RawRange
+	RecordsSize    int64
 	HighWatermark  uint64
 	LogStartOffset uint64
 	FetchedUpTo    uint64
@@ -119,12 +129,6 @@ func (p *Partition) AppendRaw(ctx context.Context, data []byte, acks Acks) (Appe
 	return AppendResult{}, fmt.Errorf("AppendRaw: unknown acks value: %d", acks)
 }
 
-// FetchRaw is the network read path. It returns raw on-disk RecordBatch bytes
-// starting at fetchOffset. No decode/re-encode occurs.
-//
-// maxBytes controls how many bytes are returned (minOneMessage semantics:
-// at least one full batch is always returned even if it exceeds maxBytes).
-//
 // replicaID = -1 for consumers, broker ID for followers.
 func (p *Partition) FetchRaw(fetchOffset uint64, replicaID int32, maxBytes int32) (FetchRawResult, error) {
 	select {
@@ -163,5 +167,45 @@ func (p *Partition) FetchRaw(fetchOffset uint64, replicaID int32, maxBytes int32
 		HighWatermark:  hw,
 		LogStartOffset: p.log.OldestOffset(),
 		FetchedUpTo:    fetchedUpTo,
+	}, nil
+}
+
+func (p *Partition) FetchRawRanges(fetchOffset uint64, replicaID int32, maxBytes int32) (FetchRawRangeResult, error) {
+	select {
+	case <-p.closed:
+		return FetchRawRangeResult{}, ErrPartitionClosed
+	default:
+	}
+	if !p.isLeader.Load() {
+		return FetchRawRangeResult{}, ErrNotLeaderOrFollower
+	}
+
+	isFollower := replicaID >= 0
+	hw := p.highWatermark.Load()
+
+	if !isFollower && fetchOffset >= hw {
+		return FetchRawRangeResult{HighWatermark: hw, LogStartOffset: p.log.OldestOffset()}, nil
+	}
+
+	if isFollower && fetchOffset >= p.log.NextOffset() {
+		p.updateFollowerLEO(replicaID, fetchOffset)
+		return FetchRawRangeResult{HighWatermark: hw, LogStartOffset: p.log.OldestOffset()}, nil
+	}
+
+	raw, err := p.log.ReadRawRanges(fetchOffset, maxBytes)
+	if err != nil {
+		return FetchRawRangeResult{}, fmt.Errorf("FetchRawRanges: log read at offset %d: %w", fetchOffset, err)
+	}
+
+	if isFollower {
+		p.updateFollowerLEO(replicaID, raw.FetchedUpTo)
+	}
+
+	return FetchRawRangeResult{
+		Ranges:         raw.Ranges,
+		RecordsSize:    raw.Bytes,
+		HighWatermark:  hw,
+		LogStartOffset: p.log.OldestOffset(),
+		FetchedUpTo:    raw.FetchedUpTo,
 	}, nil
 }

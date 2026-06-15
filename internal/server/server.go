@@ -11,18 +11,18 @@ import (
 
 // RequestHandler processes decoded Kafka requests.
 type RequestHandler interface {
-	// Handle processes one request and returns the encoded response body.
+	// Handle processes one request and returns a response body writer.
 	//   (body, nil) → send response
 	//   (nil, nil)  → suppress response (e.g. acks=0)
 	//   (nil, err)  → close connection
-	Handle(header protocol.RequestHeader, body []byte) ([]byte, error)
+	Handle(header protocol.RequestHeader, body []byte) (Response, error)
 }
 
 // Server accepts TCP connections and dispatches Kafka protocol requests.
 type Server struct {
-	listener net.Listener
-	handler  RequestHandler
-	logger   *slog.Logger
+	listener    net.Listener
+	handler     RequestHandler
+	logger      *slog.Logger
 	maxReqBytes int32
 
 	wg      sync.WaitGroup

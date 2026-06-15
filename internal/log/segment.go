@@ -538,6 +538,58 @@ func (s *Segment) ReadRawBatchAt(pos int64, maxBytes int32) ([]byte, uint64, err
 	return result, fetchedUpTo, nil
 }
 
+func (s *Segment) ReadRawRangesAt(pos int64, maxBytes int32) (ReadRawRangesResult, error) {
+	segSize := s.currentSize.Load()
+	if pos >= segSize {
+		return ReadRawRangesResult{}, fmt.Errorf("ReadRawRangesAt: pos %d at or beyond segment size %d", pos, segSize)
+	}
+
+	startPos := pos
+	var endPos int64
+	var fetchedUpTo uint64
+	remaining := int64(maxBytes)
+	first := true
+
+	for pos < segSize {
+		firstOffset, lastOffsetDelta, totalSize, err := s.ReadBatchMetaAt(pos)
+		if err != nil {
+			return ReadRawRangesResult{}, fmt.Errorf("ReadRawRangesAt: read meta at pos %d: %w", pos, err)
+		}
+
+		if pos+totalSize > segSize {
+			break // partial write at segment tail
+		}
+		if !first && totalSize > remaining {
+			break // budget exhausted
+		}
+
+		endPos = pos + totalSize
+		fetchedUpTo = firstOffset + uint64(lastOffsetDelta) + 1
+
+		remaining -= totalSize
+		pos += totalSize
+		first = false
+
+		if remaining <= 0 {
+			break
+		}
+	}
+
+	if endPos == 0 {
+		return ReadRawRangesResult{}, fmt.Errorf("ReadRawRangesAt: no complete batch at pos %d", startPos)
+	}
+
+	return ReadRawRangesResult{
+		Ranges: []RawRange{{
+			File:   s.file,
+			Offset: startPos,
+			Length: endPos - startPos,
+		}},
+		Bytes:       endPos - startPos,
+		FetchedUpTo: fetchedUpTo,
+	}, nil
+}
+
 func (s *Segment) IsFull() bool       { return s.currentSize.Load() >= s.maxSize }
 func (s *Segment) BaseOffset() uint64 { return s.baseOffset }
 func (s *Segment) NextOffset() uint64 { return s.nextOffset.Load() }

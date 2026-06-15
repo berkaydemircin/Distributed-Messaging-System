@@ -15,7 +15,6 @@ import (
 type clientConn struct {
 	conn        net.Conn
 	reader      *bufio.Reader
-	writer      *bufio.Writer
 	handler     RequestHandler
 	maxReqBytes int32
 	logger      *slog.Logger
@@ -25,7 +24,6 @@ func newClientConn(conn net.Conn, handler RequestHandler, maxReqBytes int32, log
 	return &clientConn{
 		conn:        conn,
 		reader:      bufio.NewReaderSize(conn, 64*1024),
-		writer:      bufio.NewWriterSize(conn, 64*1024),
 		handler:     handler,
 		maxReqBytes: maxReqBytes,
 		logger:      logger,
@@ -63,18 +61,18 @@ func (c *clientConn) serve(closing <-chan struct{}) {
 			"correlation", header.CorrelationID,
 			"remote", c.conn.RemoteAddr())
 
-		respBody, err := c.handler.Handle(header, body)
+		resp, err := c.handler.Handle(header, body)
 		if err != nil {
 			c.logger.Warn("handler error, closing connection",
 				"api", header.APIKey, "err", err, "remote", c.conn.RemoteAddr())
 			return
 		}
 
-		if respBody == nil {
+		if resp == nil {
 			continue // no response ie. acks=0
 		}
 
-		if err := c.writeResponse(header, respBody); err != nil {
+		if err := c.writeResponse(header, resp); err != nil {
 			c.logger.Warn("write error", "remote", c.conn.RemoteAddr(), "err", err)
 			return
 		}
@@ -104,7 +102,7 @@ func (c *clientConn) readMessage() ([]byte, error) {
 // writeResponse writes a framed Kafka response.
 // Wire format: [message_size: int32][correlation_id: int32][body]
 // For flexible response headers (v1): [correlation_id][tagged_fields][body]
-func (c *clientConn) writeResponse(reqHeader protocol.RequestHeader, body []byte) error {
+func (c *clientConn) writeResponse(reqHeader protocol.RequestHeader, resp Response) error {
 	respHeaderVersion := protocol.ResponseHeaderVersion(reqHeader.APIKey, reqHeader.APIVersion)
 
 	headerSize := 4 // correlation_id
@@ -112,7 +110,11 @@ func (c *clientConn) writeResponse(reqHeader protocol.RequestHeader, body []byte
 		headerSize += 1 // tagged_fields (just uvarint 0 = 1 byte)
 	}
 
-	totalSize := headerSize + len(body)
+	bodySize := resp.BodySize()
+	totalSize := int64(headerSize) + bodySize
+	if totalSize > int64(^uint32(0)) {
+		return fmt.Errorf("response too large: %d", totalSize)
+	}
 
 	var prefix [9]byte // size(4) + correlation_id(4) + opt tagged_fields(1)
 	binary.BigEndian.PutUint32(prefix[0:4], uint32(totalSize))
@@ -124,27 +126,29 @@ func (c *clientConn) writeResponse(reqHeader protocol.RequestHeader, body []byte
 		prefixLen = 9
 	}
 
-	// flush before writing
-	if c.writer.Buffered() > 0 {
-		if err := c.writer.Flush(); err != nil {
-			return err
+	// Fast path for ordinary byte responses: one vectored write for prefix+body.
+	if body, ok := resp.(BytesResponse); ok {
+		buffers := net.Buffers{prefix[:prefixLen]}
+		if len(body) > 0 {
+			buffers = append(buffers, []byte(body))
 		}
+		_, err := buffers.WriteTo(c.conn)
+		return err
 	}
 
-	buffers := net.Buffers{prefix[:prefixLen]}
-	if len(body) > 0 {
-		buffers = append(buffers, body)
+	w := NewResponseWriter(c.conn)
+	if err := w.WriteBytes(prefix[:prefixLen]); err != nil {
+		return err
 	}
-
-	_, err := buffers.WriteTo(c.conn)
-	return err
+	return resp.WriteBodyTo(w)
 }
 
 func isNormalClose(err error) bool {
 	if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
 		return true
 	}
-	if opErr, ok := errors.AsType[*net.OpError](err); ok {
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
 		return opErr.Err.Error() == "use of closed network connection"
 	}
 	return false

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/berkaydemircin/Distributed-Messaging-System/internal/protocol"
+	"github.com/berkaydemircin/Distributed-Messaging-System/internal/server"
 )
 
 type Handler struct {
@@ -27,7 +28,7 @@ func NewHandler(topics *TopicManager, brokerID int32, host string, port int32, l
 	}
 }
 
-func (h *Handler) Handle(header protocol.RequestHeader, body []byte) ([]byte, error) {
+func (h *Handler) Handle(header protocol.RequestHeader, body []byte) (server.Response, error) {
 	switch header.APIKey {
 	case protocol.APIKeyApiVersions:
 		return h.handleApiVersions(header)
@@ -44,19 +45,19 @@ func (h *Handler) Handle(header protocol.RequestHeader, body []byte) ([]byte, er
 	}
 }
 
-func (h *Handler) handleApiVersions(header protocol.RequestHeader) ([]byte, error) {
+func (h *Handler) handleApiVersions(header protocol.RequestHeader) (server.Response, error) {
 	switch header.APIVersion {
 	case 0, 1, 2:
-		return protocol.EncodeApiVersionsResponseV0(0), nil
+		return server.BytesResponse(protocol.EncodeApiVersionsResponseV0(0)), nil
 	case 3:
-		return protocol.EncodeApiVersionsResponseV3(0), nil
+		return server.BytesResponse(protocol.EncodeApiVersionsResponseV3(0)), nil
 	default:
 		// dont close conn, let client retry with lower version
-		return protocol.EncodeApiVersionsResponseV0(protocol.ErrCodeUnsupportedVersion), nil
+		return server.BytesResponse(protocol.EncodeApiVersionsResponseV0(protocol.ErrCodeUnsupportedVersion)), nil
 	}
 }
 
-func (h *Handler) handleProduce(header protocol.RequestHeader, body []byte) ([]byte, error) {
+func (h *Handler) handleProduce(header protocol.RequestHeader, body []byte) (server.Response, error) {
 	v := header.APIVersion
 
 	// v0 - v2 not actually supported, dont end conn
@@ -153,10 +154,10 @@ func (h *Handler) handleProduce(header protocol.RequestHeader, body []byte) ([]b
 		}
 	}
 
-	return protocol.EncodeProduceResponse(resp, v), nil
+	return server.BytesResponse(protocol.EncodeProduceResponse(resp, v)), nil
 }
 
-func (h *Handler) handleFetch(header protocol.RequestHeader, body []byte) ([]byte, error) {
+func (h *Handler) handleFetch(header protocol.RequestHeader, body []byte) (server.Response, error) {
 	v := header.APIVersion
 	if v < 4 || v > 11 {
 		return h.encodeUnsupportedVersionError(header), nil
@@ -169,38 +170,40 @@ func (h *Handler) handleFetch(header protocol.RequestHeader, body []byte) ([]byt
 
 	maxBytes := req.MaxBytes
 
-	resp := &protocol.FetchResponse{
-		SessionID: 0,
-		Topics:    make([]protocol.FetchResponseTopic, len(req.Topics)),
+	resp := &fetchStreamResponse{
+		sessionID: 0,
+		topics:    make([]fetchStreamTopic, len(req.Topics)),
 	}
 
 	for ti, reqTopic := range req.Topics {
-		respTopic := &resp.Topics[ti]
-		respTopic.Name = reqTopic.Name
-		respTopic.Partitions = make([]protocol.FetchResponsePartition, len(reqTopic.Partitions))
+		respTopic := &resp.topics[ti]
+		respTopic.name = reqTopic.Name
+		respTopic.partitions = make([]fetchStreamPartition, len(reqTopic.Partitions))
 
 		for pi, reqPart := range reqTopic.Partitions {
-			respPart := &respTopic.Partitions[pi]
-			respPart.Index = reqPart.Index
-			respPart.LastStableOffset = -1
-			respPart.LogStartOffset = -1
-			respPart.PreferredReadReplica = -1
+			respPart := &respTopic.partitions[pi]
+			respPart.index = reqPart.Index
+			respPart.lastStableOffset = -1
+			respPart.logStartOffset = -1
+			respPart.preferredReadReplica = -1
 
 			partition, errCode := h.topics.GetPartition(reqTopic.Name, reqPart.Index)
 			if errCode != ErrNone {
-				respPart.ErrorCode = int16(errCode)
+				respPart.errorCode = int16(errCode)
+				respPart.recordsSize = 0
 				continue
 			}
 
 			partMax := min(maxBytes, reqPart.MaxBytes)
 
-			result, err := partition.FetchRaw(
+			result, err := partition.FetchRawRanges(
 				uint64(reqPart.FetchOffset),
 				req.ReplicaID,
 				partMax,
 			)
 			if err != nil {
-				respPart.ErrorCode = int16(ErrStorageError)
+				respPart.errorCode = int16(ErrStorageError)
+				respPart.recordsSize = 0
 				h.logger.Warn("fetch failed",
 					"topic", reqTopic.Name,
 					"partition", reqPart.Index,
@@ -209,18 +212,18 @@ func (h *Handler) handleFetch(header protocol.RequestHeader, body []byte) ([]byt
 				continue
 			}
 
-			respPart.HighWatermark = int64(result.HighWatermark)
-			respPart.LastStableOffset = int64(result.HighWatermark) // non-transactional
-			respPart.LogStartOffset = int64(result.LogStartOffset)
-			respPart.Records = result.Records
-
+			respPart.highWatermark = int64(result.HighWatermark)
+			respPart.lastStableOffset = int64(result.HighWatermark) // non-transactional
+			respPart.logStartOffset = int64(result.LogStartOffset)
+			respPart.recordsSize = result.RecordsSize
+			respPart.ranges = result.Ranges
 		}
 	}
 
-	return protocol.EncodeFetchResponse(resp, v), nil
+	return encodeFetchStreamResponse(resp, v), nil
 }
 
-func (h *Handler) handleMetadata(header protocol.RequestHeader, body []byte) ([]byte, error) {
+func (h *Handler) handleMetadata(header protocol.RequestHeader, body []byte) (server.Response, error) {
 	v := header.APIVersion
 	if v < 0 || v > 8 {
 		return h.encodeUnsupportedVersionError(header), nil
@@ -290,17 +293,17 @@ func (h *Handler) handleMetadata(header protocol.RequestHeader, body []byte) ([]
 		}
 	}
 
-	return protocol.EncodeMetadataResponse(resp, v), nil
+	return server.BytesResponse(protocol.EncodeMetadataResponse(resp, v)), nil
 }
 
 // TODO header is redundant for now, will implement more fine grained error later
-func (h *Handler) encodeUnsupportedVersionError(header protocol.RequestHeader) []byte {
+func (h *Handler) encodeUnsupportedVersionError(header protocol.RequestHeader) server.Response {
 	e := protocol.NewEncoder(2)
 	e.PutInt16(protocol.ErrCodeUnsupportedVersion)
-	return e.Bytes()
+	return server.BytesResponse(e.Bytes())
 }
 
-func (h *Handler) handleListOffsets(header protocol.RequestHeader, body []byte) ([]byte, error) {
+func (h *Handler) handleListOffsets(header protocol.RequestHeader, body []byte) (server.Response, error) {
 	v := header.APIVersion
 	if v < 1 || v > 5 {
 		return h.encodeUnsupportedVersionError(header), nil
@@ -348,5 +351,5 @@ func (h *Handler) handleListOffsets(header protocol.RequestHeader, body []byte) 
 		}
 	}
 
-	return protocol.EncodeListOffsetsResponse(resp, v), nil
+	return server.BytesResponse(protocol.EncodeListOffsetsResponse(resp, v)), nil
 }
