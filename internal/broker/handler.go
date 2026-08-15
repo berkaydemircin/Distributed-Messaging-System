@@ -2,6 +2,7 @@ package broker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -194,6 +195,12 @@ func (h *Handler) handleFetch(header protocol.RequestHeader, body []byte) (serve
 				continue
 			}
 
+			if reqPart.FetchOffset < 0 {
+				respPart.errorCode = int16(ErrOffsetOutOfRange)
+				respPart.recordsSize = 0
+				continue
+			}
+
 			partMax := min(maxBytes, reqPart.MaxBytes)
 
 			result, err := partition.FetchRawRanges(
@@ -202,7 +209,12 @@ func (h *Handler) handleFetch(header protocol.RequestHeader, body []byte) (serve
 				partMax,
 			)
 			if err != nil {
-				respPart.errorCode = int16(ErrStorageError)
+				var ec ErrorCode
+				if errors.As(err, &ec) {
+					respPart.errorCode = int16(ec)
+				} else {
+					respPart.errorCode = int16(ErrStorageError)
+				}
 				respPart.recordsSize = 0
 				h.logger.Warn("fetch failed",
 					"topic", reqTopic.Name,
@@ -213,7 +225,7 @@ func (h *Handler) handleFetch(header protocol.RequestHeader, body []byte) (serve
 			}
 
 			respPart.highWatermark = int64(result.HighWatermark)
-			respPart.lastStableOffset = int64(result.HighWatermark) // non-transactional
+			respPart.lastStableOffset = int64(result.HighWatermark)
 			respPart.logStartOffset = int64(result.LogStartOffset)
 			respPart.recordsSize = result.RecordsSize
 			respPart.ranges = result.Ranges

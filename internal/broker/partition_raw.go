@@ -1,11 +1,20 @@
 package broker
 
 import (
+	"bytes"
 	"container/heap"
 	"context"
+	"encoding/binary"
 	"fmt"
+	"io"
 
 	storagelog "github.com/berkaydemircin/Distributed-Messaging-System/internal/log"
+)
+
+// TODO this feels like bad design having this all over the place, used by capHW at the bottom
+const (
+	recordBatchOverhead   = 61 // check internal/log for these
+	batchMetaPrefixLength = 27
 )
 
 type FetchRawResult struct {
@@ -39,7 +48,7 @@ func (p *Partition) AppendRaw(ctx context.Context, data []byte, acks Acks) (Appe
 		ctx = context.Background()
 	}
 
-	if len(data) < 27 {
+	if len(data) < batchMetaPrefixLength {
 		return AppendResult{}, fmt.Errorf("AppendRaw: batch too short (%d bytes)", len(data))
 	}
 
@@ -141,16 +150,23 @@ func (p *Partition) FetchRaw(fetchOffset uint64, replicaID int32, maxBytes int32
 	}
 
 	isFollower := replicaID >= 0
+	leaderLEO := p.log.NextOffset()
+	logStart := p.log.OldestOffset()
+
+	if fetchOffset < logStart || fetchOffset > leaderLEO {
+		return FetchRawResult{}, ErrOffsetOutOfRange
+	}
+
 	hw := p.highWatermark.Load()
 
 	if !isFollower && fetchOffset >= hw {
-		return FetchRawResult{HighWatermark: hw, LogStartOffset: p.log.OldestOffset()}, nil
+		return FetchRawResult{HighWatermark: hw, LogStartOffset: logStart}, nil
 	}
 
-	// Followers fetch up to LEO; update their tracked position.
-	if isFollower && fetchOffset >= p.log.NextOffset() {
+	if isFollower && fetchOffset == leaderLEO {
 		p.updateFollowerLEO(replicaID, fetchOffset)
-		return FetchRawResult{HighWatermark: hw, LogStartOffset: p.log.OldestOffset()}, nil
+		hw = p.highWatermark.Load()
+		return FetchRawResult{HighWatermark: hw, LogStartOffset: logStart}, nil
 	}
 
 	raw, fetchedUpTo, err := p.log.ReadRaw(fetchOffset, maxBytes)
@@ -159,13 +175,27 @@ func (p *Partition) FetchRaw(fetchOffset uint64, replicaID int32, maxBytes int32
 	}
 
 	if isFollower {
-		p.updateFollowerLEO(replicaID, fetchedUpTo)
+		p.updateFollowerLEO(replicaID, fetchOffset)
+		hw = p.highWatermark.Load()
+	}
+
+	if !isFollower && fetchedUpTo > hw {
+		n, upto, err := capToHW(bytes.NewReader(raw), 0, int64(len(raw)), hw, fetchOffset)
+		if err != nil {
+			return FetchRawResult{}, fmt.Errorf("FetchRaw: capping to HW: %w", err)
+		}
+		if n == 0 {
+			raw = nil
+		} else {
+			raw = raw[:n]
+		}
+		fetchedUpTo = upto
 	}
 
 	return FetchRawResult{
 		Records:        raw,
 		HighWatermark:  hw,
-		LogStartOffset: p.log.OldestOffset(),
+		LogStartOffset: logStart,
 		FetchedUpTo:    fetchedUpTo,
 	}, nil
 }
@@ -181,15 +211,23 @@ func (p *Partition) FetchRawRanges(fetchOffset uint64, replicaID int32, maxBytes
 	}
 
 	isFollower := replicaID >= 0
+	leaderLEO := p.log.NextOffset()
+	logStart := p.log.OldestOffset()
+
+	if fetchOffset < logStart || fetchOffset > leaderLEO {
+		return FetchRawRangeResult{}, ErrOffsetOutOfRange
+	}
+
 	hw := p.highWatermark.Load()
 
 	if !isFollower && fetchOffset >= hw {
-		return FetchRawRangeResult{HighWatermark: hw, LogStartOffset: p.log.OldestOffset()}, nil
+		return FetchRawRangeResult{HighWatermark: hw, LogStartOffset: logStart}, nil
 	}
 
-	if isFollower && fetchOffset >= p.log.NextOffset() {
+	if isFollower && fetchOffset == leaderLEO {
 		p.updateFollowerLEO(replicaID, fetchOffset)
-		return FetchRawRangeResult{HighWatermark: hw, LogStartOffset: p.log.OldestOffset()}, nil
+		hw = p.highWatermark.Load()
+		return FetchRawRangeResult{HighWatermark: hw, LogStartOffset: logStart}, nil
 	}
 
 	raw, err := p.log.ReadRawRanges(fetchOffset, maxBytes)
@@ -198,14 +236,84 @@ func (p *Partition) FetchRawRanges(fetchOffset uint64, replicaID int32, maxBytes
 	}
 
 	if isFollower {
-		p.updateFollowerLEO(replicaID, raw.FetchedUpTo)
+		p.updateFollowerLEO(replicaID, fetchOffset)
+		hw = p.highWatermark.Load()
+	}
+
+	ranges := raw.Ranges
+	recordsSize := raw.Bytes
+	fetchedUpTo := raw.FetchedUpTo
+
+	if !isFollower && fetchedUpTo > hw {
+		capped := make([]storagelog.RawRange, 0, len(ranges))
+		var size int64
+		upto := fetchOffset
+		for _, rg := range ranges {
+			n, u, err := capToHW(rg.File, rg.Offset, rg.Length, hw, upto)
+			if err != nil {
+				return FetchRawRangeResult{}, fmt.Errorf("FetchRawRanges: capping to HW: %w", err)
+			}
+			if n > 0 {
+				capped = append(capped, storagelog.RawRange{File: rg.File, Offset: rg.Offset, Length: n})
+				size += n
+				upto = u
+			}
+			if n < rg.Length {
+				break
+			}
+		}
+		ranges = capped
+		recordsSize = size
+		fetchedUpTo = upto
 	}
 
 	return FetchRawRangeResult{
-		Ranges:         raw.Ranges,
-		RecordsSize:    raw.Bytes,
+		Ranges:         ranges,
+		RecordsSize:    recordsSize,
 		HighWatermark:  hw,
-		LogStartOffset: p.log.OldestOffset(),
-		FetchedUpTo:    raw.FetchedUpTo,
+		LogStartOffset: logStart,
+		FetchedUpTo:    fetchedUpTo,
 	}, nil
+}
+
+func capToHW(r io.ReaderAt, pos, length int64, maxOffset, fallback uint64) (cappedLength int64, exclusiveEnd uint64, err error) {
+	exclusiveEnd = fallback
+	var consumed int64
+	var hdr [batchMetaPrefixLength]byte
+
+	for consumed < length {
+		if length-consumed < batchMetaPrefixLength {
+			return 0, fallback, fmt.Errorf(
+				"capToHW: %d trailing bytes at offset %d don't form a complete batch header",
+				length-consumed, pos+consumed)
+		}
+		if _, err := r.ReadAt(hdr[:], pos+consumed); err != nil {
+			return 0, fallback, fmt.Errorf("capToHW: read at %d: %w", pos+consumed, err)
+		}
+
+		baseOffset := binary.BigEndian.Uint64(hdr[0:8])
+		batchLength := binary.BigEndian.Uint32(hdr[8:12])
+		lastOffsetDelta := binary.BigEndian.Uint32(hdr[23:27])
+
+		totalSize := int64(12) + int64(batchLength)
+		if totalSize < recordBatchOverhead {
+			return 0, fallback, fmt.Errorf(
+				"capToHW: batch at offset %d claims size %d, below the %d-byte minimum",
+				pos+consumed, totalSize, recordBatchOverhead)
+		}
+		if consumed+totalSize > length {
+			return 0, fallback, fmt.Errorf(
+				"capToHW: batch at offset %d claims size %d, exceeding the %d bytes available",
+				pos+consumed, totalSize, length-consumed)
+		}
+
+		batchEnd := baseOffset + uint64(lastOffsetDelta) + 1
+		if batchEnd > maxOffset {
+			break
+		}
+		consumed += totalSize
+		exclusiveEnd = batchEnd
+	}
+
+	return consumed, exclusiveEnd, nil
 }
