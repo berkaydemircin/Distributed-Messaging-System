@@ -99,7 +99,7 @@ func (p *Partition) AppendRaw(ctx context.Context, data []byte, acks Acks) (Appe
 	}
 
 	requiredHW = firstOffset + uint64(lod) + 1
-
+	p.notifyWaiters()
 	if acks == AcksAll {
 		notify = make(chan struct{})
 		entry = &purgatoryEntry{requiredHW: requiredHW, notify: notify}
@@ -123,7 +123,7 @@ func (p *Partition) AppendRaw(ctx context.Context, data []byte, acks Acks) (Appe
 
 	case AcksAll:
 		p.maybeAdvanceHW()
-		
+
 		select {
 		case <-notify:
 			return AppendResult{
@@ -235,7 +235,7 @@ func (p *Partition) FetchRaw(fetchOffset uint64, replicaID int32, maxBytes int32
 	}, nil
 }
 
-func (p *Partition) FetchRawRanges(fetchOffset uint64, replicaID int32, maxBytes int32) (FetchRawRangeResult, error) {
+func (p *Partition) FetchRawRanges(fetchOffset uint64, replicaID int32, maxBytes int32, allowOversizedFirstBatch bool) (FetchRawRangeResult, error) {
 	select {
 	case <-p.closed:
 		return FetchRawRangeResult{}, ErrPartitionClosed
@@ -256,13 +256,23 @@ func (p *Partition) FetchRawRanges(fetchOffset uint64, replicaID int32, maxBytes
 	hw := p.highWatermark.Load()
 
 	if !isFollower && fetchOffset >= hw {
-		return FetchRawRangeResult{HighWatermark: hw, LogStartOffset: logStart}, nil
+
+		return FetchRawRangeResult{
+			HighWatermark:  hw,
+			LogStartOffset: logStart,
+			FetchedUpTo:    fetchOffset,
+		}, nil
 	}
 
 	if isFollower && fetchOffset == leaderLEO {
 		p.updateFollowerLEO(replicaID, fetchOffset)
 		hw = p.highWatermark.Load()
-		return FetchRawRangeResult{HighWatermark: hw, LogStartOffset: logStart}, nil
+
+		return FetchRawRangeResult{
+			HighWatermark:  hw,
+			LogStartOffset: logStart,
+			FetchedUpTo:    fetchOffset,
+		}, nil
 	}
 
 	raw, err := p.log.ReadRawRanges(fetchOffset, maxBytes)
@@ -278,6 +288,14 @@ func (p *Partition) FetchRawRanges(fetchOffset uint64, replicaID int32, maxBytes
 	ranges := raw.Ranges
 	recordsSize := raw.Bytes
 	fetchedUpTo := raw.FetchedUpTo
+
+	if !allowOversizedFirstBatch && recordsSize > int64(maxBytes) {
+		return FetchRawRangeResult{
+			HighWatermark:  hw,
+			LogStartOffset: logStart,
+			FetchedUpTo:    fetchOffset,
+		}, nil
+	}
 
 	if !isFollower && fetchedUpTo > hw {
 		capped := make([]storagelog.RawRange, 0, len(ranges))

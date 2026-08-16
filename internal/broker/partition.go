@@ -130,6 +130,8 @@ type Partition struct {
 
 	purgatory   purgatoryHeap
 	purgatoryMu sync.Mutex
+	notifyMu sync.RWMutex
+	notifyCh chan struct{}
 
 	closed    chan struct{}
 	closeOnce sync.Once
@@ -142,6 +144,7 @@ func NewPartition(topicName string, partitionID int32, localBrokerID int32, l *l
 		localBrokerID: localBrokerID,
 		log:           l,
 		closed:        make(chan struct{}),
+		notifyCh: make(chan struct{}),
 	}
 	heap.Init(&p.purgatory)
 	p.highWatermark.Store(l.OldestOffset())
@@ -150,6 +153,7 @@ func NewPartition(topicName string, partitionID int32, localBrokerID int32, l *l
 
 // WARNING MakeLeader is for leadership transitions, not in place ISR updates.
 func (p *Partition) MakeLeader(epoch uint32, initialISR []int32, initialHW uint64) {
+	defer p.notifyWaiters()
 	p.appendMu.Lock()
 
 	p.isrMu.Lock()
@@ -167,6 +171,7 @@ func (p *Partition) MakeLeader(epoch uint32, initialISR []int32, initialHW uint6
 }
 
 func (p *Partition) MakeFollower(epoch uint32, _ int32) {
+	defer p.notifyWaiters()
 	p.appendMu.Lock()
 
 	p.isLeader.Store(false)
@@ -370,6 +375,7 @@ func (p *Partition) maybeAdvanceHW() {
 	}
 
 	p.drainPurgatory(newHW)
+	p.notifyWaiters()
 }
 
 // drain purgatory up to and including hw
@@ -403,7 +409,7 @@ func (p *Partition) Close() error {
 
 	p.closeOnce.Do(func() {
 		close(p.closed)
-
+		defer p.notifyWaiters()
 		p.appendMu.Lock()
 		defer p.appendMu.Unlock()
 
@@ -419,6 +425,19 @@ func (p *Partition) Close() error {
 func (p *Partition) HighWatermark() uint64 { return p.highWatermark.Load() }
 func (p *Partition) LEO() uint64           { return p.log.NextOffset() }
 func (p *Partition) IsLeader() bool        { return p.isLeader.Load() }
+
+func (p *Partition) NotifyChan() <-chan struct{} {
+	p.notifyMu.RLock()
+	defer p.notifyMu.RUnlock()
+	return p.notifyCh
+}
+
+func (p *Partition) notifyWaiters() {
+	p.notifyMu.Lock()
+	close(p.notifyCh)
+	p.notifyCh = make(chan struct{})
+	p.notifyMu.Unlock()
+}
 
 func (p *Partition) LeaderEpoch() uint32 {
 	p.isrMu.RLock()

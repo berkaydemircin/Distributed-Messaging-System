@@ -71,11 +71,6 @@ func (h *Handler) handleProduce(header protocol.RequestHeader, body []byte) (ser
 		return nil, fmt.Errorf("decode produce v%d: %w", v, err)
 	}
 
-	// Validate the raw wire value before any conversion. This is on top of
-	// - not instead of - Acks now being int16 (matching the wire type
-	// exactly, which already makes the old truncation bug structurally
-	// impossible): a value like 5 is a real, in-range int16, just not one
-	// of the three acks levels that mean anything.
 	if req.Acks != -1 && req.Acks != 0 && req.Acks != 1 {
 		resp := &protocol.ProduceResponse{Topics: make([]protocol.ProduceResponseTopic, len(req.Topics))}
 		for ti, reqTopic := range req.Topics {
@@ -194,12 +189,33 @@ func (h *Handler) handleFetch(header protocol.RequestHeader, body []byte) (serve
 		return nil, fmt.Errorf("decode fetch v%d: %w", v, err)
 	}
 
-	maxBytes := req.MaxBytes
+	deadline := time.Now().Add(time.Duration(req.MaxWaitMs) * time.Millisecond)
 
-	resp := &fetchStreamResponse{
+	for {
+		resp, totalBytes, waitChans, hasError := h.fetchOnePass(req)
+
+		if hasError || totalBytes >= int64(req.MinBytes) || req.MaxWaitMs <= 0 || len(waitChans) == 0 {
+			return encodeFetchStreamResponse(resp, v), nil
+		}
+
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return encodeFetchStreamResponse(resp, v), nil
+		}
+
+		if !waitForAny(waitChans, remaining) {
+			continue
+		}
+	}
+}
+
+func (h *Handler) fetchOnePass(req *protocol.FetchRequest) (resp *fetchStreamResponse, totalBytes int64, waitChans []<-chan struct{}, hasError bool) {
+	resp = &fetchStreamResponse{
 		sessionID: 0,
 		topics:    make([]fetchStreamTopic, len(req.Topics)),
 	}
+	remaining := int64(req.MaxBytes)
+	firstBatchReturned := false
 
 	for ti, reqTopic := range req.Topics {
 		respTopic := &resp.topics[ti]
@@ -217,21 +233,33 @@ func (h *Handler) handleFetch(header protocol.RequestHeader, body []byte) (serve
 			if errCode != ErrNone {
 				respPart.errorCode = int16(errCode)
 				respPart.recordsSize = 0
+				hasError = true
 				continue
 			}
 
 			if reqPart.FetchOffset < 0 {
 				respPart.errorCode = int16(ErrOffsetOutOfRange)
 				respPart.recordsSize = 0
+				hasError = true
 				continue
 			}
 
-			partMax := min(maxBytes, reqPart.MaxBytes)
+			ch := partition.NotifyChan()
+
+			partMax := reqPart.MaxBytes
+			if remaining < int64(partMax) {
+				if remaining < 0 {
+					partMax = 0
+				} else {
+					partMax = int32(remaining)
+				}
+			}
 
 			result, err := partition.FetchRawRanges(
 				uint64(reqPart.FetchOffset),
 				req.ReplicaID,
 				partMax,
+				!firstBatchReturned,
 			)
 			if err != nil {
 				var ec ErrorCode
@@ -241,6 +269,7 @@ func (h *Handler) handleFetch(header protocol.RequestHeader, body []byte) (serve
 					respPart.errorCode = int16(ErrStorageError)
 				}
 				respPart.recordsSize = 0
+				hasError = true
 				h.logger.Warn("fetch failed",
 					"topic", reqTopic.Name,
 					"partition", reqPart.Index,
@@ -254,10 +283,51 @@ func (h *Handler) handleFetch(header protocol.RequestHeader, body []byte) (serve
 			respPart.logStartOffset = int64(result.LogStartOffset)
 			respPart.recordsSize = result.RecordsSize
 			respPart.ranges = result.Ranges
+			waitChans = append(waitChans, ch)
+
+			totalBytes += result.RecordsSize
+			if result.RecordsSize > 0 {
+				firstBatchReturned = true
+				remaining -= result.RecordsSize
+			}
 		}
 	}
 
-	return encodeFetchStreamResponse(resp, v), nil
+	return resp, totalBytes, waitChans, hasError
+}
+
+// waitForAny blocks until any channel closes or the timeout elapses.
+func waitForAny(chans []<-chan struct{}, timeout time.Duration) bool {
+	if len(chans) == 0 {
+		return false
+	}
+
+	woken := make(chan struct{}, 1)
+	done := make(chan struct{})
+	defer close(done)
+
+	for _, ch := range chans {
+		go func(ch <-chan struct{}) {
+			select {
+			case <-ch:
+				select {
+				case woken <- struct{}{}:
+				default:
+				}
+			case <-done:
+			}
+		}(ch)
+	}
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	select {
+	case <-woken:
+		return true
+	case <-timer.C:
+		return false
+	}
 }
 
 func (h *Handler) handleMetadata(header protocol.RequestHeader, body []byte) (server.Response, error) {
