@@ -14,14 +14,14 @@ import (
 
 func main() {
 	var (
-		brokerID        = flag.Int("broker-id", 0, "unique broker ID")
-		host            = flag.String("host", "localhost", "advertised hostname")
-		port            = flag.Int("port", 9092, "listener port")
-		logDir          = flag.String("log-dir", "/tmp/msgbroker-data", "data directory")
-		segmentBytes    = flag.Int64("segment-bytes", 1<<30, "max segment size (bytes)")
-		indexBytes      = flag.Int64("index-bytes", 1<<20, "max index size (bytes)")
-		indexInterval   = flag.Int64("index-interval", 4096, "index interval (bytes)")
-		logLevel        = flag.String("log-level", "info", "log level: debug, info, warn, error")
+		brokerID      = flag.Int("broker-id", 0, "unique broker ID")
+		host          = flag.String("host", "localhost", "advertised hostname")
+		port          = flag.Int("port", 9092, "listener port")
+		logDir        = flag.String("log-dir", "/tmp/msgbroker-data", "data directory")
+		segmentBytes  = flag.Int64("segment-bytes", 1<<30, "max segment size (bytes)")
+		indexBytes    = flag.Int64("index-bytes", 1<<20, "max index size (bytes)")
+		indexInterval = flag.Int64("index-interval", 4096, "index interval (bytes)")
+		logLevel      = flag.String("log-level", "info", "log level: debug, info, warn, error")
 	)
 	flag.Parse()
 

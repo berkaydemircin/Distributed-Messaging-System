@@ -130,8 +130,8 @@ type Partition struct {
 
 	purgatory   purgatoryHeap
 	purgatoryMu sync.Mutex
-	notifyMu sync.RWMutex
-	notifyCh chan struct{}
+	notifyMu    sync.RWMutex
+	notifyCh    chan struct{}
 
 	closed    chan struct{}
 	closeOnce sync.Once
@@ -144,7 +144,7 @@ func NewPartition(topicName string, partitionID int32, localBrokerID int32, l *l
 		localBrokerID: localBrokerID,
 		log:           l,
 		closed:        make(chan struct{}),
-		notifyCh: make(chan struct{}),
+		notifyCh:      make(chan struct{}),
 	}
 	heap.Init(&p.purgatory)
 	p.highWatermark.Store(l.OldestOffset())

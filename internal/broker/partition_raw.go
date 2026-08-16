@@ -2,10 +2,10 @@ package broker
 
 import (
 	"bytes"
-	"errors"
 	"container/heap"
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 

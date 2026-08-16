@@ -42,7 +42,7 @@ func EncodeApiVersionsResponseV3(errorCode int16) []byte {
 		e.PutTaggedFields() // per-entry tagged fields
 	}
 
-	e.PutInt32(0)        // throttle_time_ms
-	e.PutTaggedFields()  // top-level tagged fields
+	e.PutInt32(0)       // throttle_time_ms
+	e.PutTaggedFields() // top-level tagged fields
 	return e.Bytes()
 }
