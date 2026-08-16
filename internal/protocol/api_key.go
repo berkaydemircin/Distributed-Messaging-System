@@ -21,7 +21,7 @@ type APIVersion struct {
 // set of apis the broker advertises
 // WARNING handler returns UNSUPPORTED_VERSION for v0 - v2
 var SupportedAPIVersions = []APIVersion{
-	{APIKeyProduce, 0, 8},
+	{APIKeyProduce, 3, 8},
 	{APIKeyFetch, 4, 11},
 	{APIKeyListOffsets, 1, 5},
 	{APIKeyMetadata, 0, 8},

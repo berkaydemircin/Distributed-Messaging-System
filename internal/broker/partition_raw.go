@@ -2,6 +2,7 @@ package broker
 
 import (
 	"bytes"
+	"errors"
 	"container/heap"
 	"context"
 	"encoding/binary"
@@ -48,8 +49,12 @@ func (p *Partition) AppendRaw(ctx context.Context, data []byte, acks Acks) (Appe
 		ctx = context.Background()
 	}
 
-	if len(data) < batchMetaPrefixLength {
-		return AppendResult{}, fmt.Errorf("AppendRaw: batch too short (%d bytes)", len(data))
+	if len(data) < recordBatchOverhead {
+		return AppendResult{}, ErrCorruptMessage
+	}
+
+	if acks != AcksNone && acks != AcksLeader && acks != AcksAll {
+		return AppendResult{}, ErrInvalidRequiredAcks
 	}
 
 	var (
@@ -82,6 +87,14 @@ func (p *Partition) AppendRaw(ctx context.Context, data []byte, acks Acks) (Appe
 	firstOffset, lod, err = p.log.AppendRaw(data, int32(epoch))
 	if err != nil {
 		p.appendMu.Unlock()
+		switch {
+		case errors.Is(err, storagelog.ErrCorruptBatch):
+			return AppendResult{}, ErrCorruptMessage
+		case errors.Is(err, storagelog.ErrUnsupportedMessageFormat):
+			return AppendResult{}, ErrUnsupportedForMessageFormat
+		case errors.Is(err, storagelog.ErrMessageTooLarge):
+			return AppendResult{}, ErrMessageTooLarge
+		}
 		return AppendResult{}, fmt.Errorf("AppendRaw: log: %w", err)
 	}
 
@@ -110,22 +123,44 @@ func (p *Partition) AppendRaw(ctx context.Context, data []byte, acks Acks) (Appe
 
 	case AcksAll:
 		p.maybeAdvanceHW()
+		
+		select {
+		case <-notify:
+			return AppendResult{
+				FirstOffset: firstOffset,
+				Done:        notify,
+				ErrFn:       func() *ErrorCode { return entry.err },
+			}, nil
+		default:
+		}
 
 		if ctxDone := ctx.Done(); ctxDone != nil {
-			go func() {
-				select {
-				case <-notify:
-				case <-ctxDone:
-					p.purgatoryMu.Lock()
-					if entry.index < p.purgatory.Len() && p.purgatory[entry.index] == entry {
-						heap.Remove(&p.purgatory, entry.index)
-						timeoutErr := ErrRequestTimedOut
-						entry.err = &timeoutErr
-						close(notify)
-					}
-					p.purgatoryMu.Unlock()
+			select {
+			case <-ctxDone:
+				p.purgatoryMu.Lock()
+				if entry.index < p.purgatory.Len() && p.purgatory[entry.index] == entry {
+					heap.Remove(&p.purgatory, entry.index)
+					timeoutErr := ErrRequestTimedOut
+					entry.err = &timeoutErr
+					close(notify)
 				}
-			}()
+				p.purgatoryMu.Unlock()
+			default:
+				go func() {
+					select {
+					case <-notify:
+					case <-ctxDone:
+						p.purgatoryMu.Lock()
+						if entry.index < p.purgatory.Len() && p.purgatory[entry.index] == entry {
+							heap.Remove(&p.purgatory, entry.index)
+							timeoutErr := ErrRequestTimedOut
+							entry.err = &timeoutErr
+							close(notify)
+						}
+						p.purgatoryMu.Unlock()
+					}
+				}()
+			}
 		}
 
 		return AppendResult{

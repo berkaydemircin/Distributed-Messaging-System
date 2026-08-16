@@ -6,6 +6,21 @@ import (
 )
 
 func (l *Log) AppendRaw(data []byte, leaderEpoch int32) (baseOffset uint64, lastOffsetDelta uint32, err error) {
+	bounds, err := scanRawBatches(data)
+	if err != nil {
+		return 0, 0, err
+	}
+	if len(bounds) == 0 {
+		return 0, 0, fmt.Errorf("%w: empty records", ErrCorruptBatch)
+	}
+
+	for i, b := range bounds {
+		if b.size > l.config.MaxMessageBytes {
+			return 0, 0, fmt.Errorf("%w: batch %d/%d is %d bytes, exceeds MaxMessageBytes=%d",
+				ErrMessageTooLarge, i+1, len(bounds), b.size, l.config.MaxMessageBytes)
+		}
+	}
+
 	l.writeMu.Lock()
 	defer l.writeMu.Unlock()
 
@@ -18,19 +33,16 @@ func (l *Log) AppendRaw(data []byte, leaderEpoch int32) (baseOffset uint64, last
 		}
 	}
 
-	assignedOffset, pos, lod, err := active.segment.AppendRawBatch(data, leaderEpoch)
-	if errors.Is(err, ErrSegmentFull) {
-		if active.segment.Size() == 0 {
-			return 0, 0, fmt.Errorf("AppendRaw: batch too large for any segment (max=%d)", l.config.MaxSegmentBytes)
-		}
+	assignedOffset, pos, totalRecords, aErr := active.segment.AppendRawBatches(data, bounds, leaderEpoch)
+	if errors.Is(aErr, ErrSegmentFull) {
 		active, err = l.roll()
 		if err != nil {
 			return 0, 0, fmt.Errorf("AppendRaw: roll after full: %w", err)
 		}
-		assignedOffset, pos, lod, err = active.segment.AppendRawBatch(data, leaderEpoch)
+		assignedOffset, pos, totalRecords, aErr = active.segment.AppendRawBatches(data, bounds, leaderEpoch)
 	}
-	if err != nil {
-		return 0, 0, fmt.Errorf("AppendRaw: %w", err)
+	if aErr != nil {
+		return 0, 0, fmt.Errorf("AppendRaw: %w", aErr)
 	}
 
 	active.bytesSinceIndex += int64(len(data))
@@ -41,7 +53,7 @@ func (l *Log) AppendRaw(data []byte, leaderEpoch int32) (baseOffset uint64, last
 		active.bytesSinceIndex = 0
 	}
 
-	return assignedOffset, lod, nil
+	return assignedOffset, uint32(totalRecords - 1), nil
 }
 
 func (l *Log) ReadRaw(offset uint64, maxBytes int32) ([]byte, uint64, error) {

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"slices"
@@ -15,6 +16,11 @@ import (
 )
 
 var ErrSegmentFull = errors.New("segment full")
+var ErrMessageTooLarge = errors.New("batch exceeds max.message.bytes")
+var ErrCorruptBatch = errors.New("corrupt or malformed record batch")
+var ErrMultipleBatchesUnsupported = errors.New("AppendRawBatch received more than one batch")
+var ErrUnsupportedMessageFormat = errors.New("unsupported record batch magic byte")
+
 var crc32cTable = crc32.MakeTable(crc32.Castagnoli)
 
 const (
@@ -402,33 +408,82 @@ func (s *Segment) AppendBatch(batch *protocol.Batch) (int64, error) {
 	return pos, nil
 }
 
-func (s *Segment) AppendRawBatch(data []byte, leaderEpoch int32) (baseOffset uint64, pos int64, lastOffsetDelta uint32, err error) {
+func validateRawBatch(data []byte) (totalSize int64, lastOffsetDelta uint32, err error) {
 	if len(data) < recordBatchOverhead {
-		return 0, 0, 0, fmt.Errorf("AppendRawBatch: too short (%d bytes, need ≥%d)", len(data), recordBatchOverhead)
+		return 0, 0, fmt.Errorf("%w: too short (%d bytes, need ≥%d)", ErrCorruptBatch, len(data), recordBatchOverhead)
 	}
 
-	batchLength := int64(binary.BigEndian.Uint32(data[8:12]))
-	totalSize := 12 + batchLength
-
+	batchLength := int32(binary.BigEndian.Uint32(data[8:12]))
+	if batchLength < 0 {
+		return 0, 0, fmt.Errorf("%w: batchLength %d is negative", ErrCorruptBatch, batchLength)
+	}
+	totalSize = 12 + int64(batchLength)
+	if totalSize < recordBatchOverhead {
+		return 0, 0, fmt.Errorf("%w: declared batchLength=%d implies a %d-byte batch, below the %d-byte minimum",
+			ErrCorruptBatch, batchLength, totalSize, recordBatchOverhead)
+	}
 	if int64(len(data)) < totalSize {
-		return 0, 0, 0, fmt.Errorf("AppendRawBatch: declared batchLength=%d needs %d bytes, have %d",
-			batchLength, totalSize, len(data))
-	}
-	if int64(len(data)) != totalSize {
-		return 0, 0, 0, fmt.Errorf("AppendRawBatch: multiple RecordBatches in one records field are not supported: first batch needs %d bytes, have %d",
-			totalSize, len(data))
+		return 0, 0, fmt.Errorf("%w: declared batchLength=%d needs %d bytes, have %d",
+			ErrCorruptBatch, batchLength, totalSize, len(data))
 	}
 	if data[16] != 2 {
-		return 0, 0, 0, fmt.Errorf("AppendRawBatch: unsupported magic %d", data[16])
+		return 0, 0, fmt.Errorf("%w: got magic %d, want 2", ErrUnsupportedMessageFormat, data[16])
 	}
 
 	storedCRC := binary.BigEndian.Uint32(data[17:21])
 	if crc32.Checksum(data[21:totalSize], crc32cTable) != storedCRC {
-		return 0, 0, 0, fmt.Errorf("AppendRawBatch: CRC32C mismatch")
+		return 0, 0, fmt.Errorf("%w: CRC32C mismatch", ErrCorruptBatch)
+	}
+
+	lastOffsetDeltaSigned := int32(binary.BigEndian.Uint32(data[23:27]))
+	if lastOffsetDeltaSigned < 0 {
+		return 0, 0, fmt.Errorf("%w: lastOffsetDelta %d is negative", ErrCorruptBatch, lastOffsetDeltaSigned)
+	}
+	recordCount := int32(binary.BigEndian.Uint32(data[57:61]))
+	if recordCount <= 0 {
+		return 0, 0, fmt.Errorf("%w: recordCount %d must be positive", ErrCorruptBatch, recordCount)
+	}
+	if lastOffsetDeltaSigned != recordCount-1 {
+		return 0, 0, fmt.Errorf("%w: lastOffsetDelta=%d inconsistent with recordCount=%d (want lastOffsetDelta=recordCount-1)",
+			ErrCorruptBatch, lastOffsetDeltaSigned, recordCount)
+	}
+
+	lastOffsetDelta = uint32(lastOffsetDeltaSigned)
+	return totalSize, lastOffsetDelta, nil
+}
+
+type batchBounds struct {
+	offset          int64
+	size            int64
+	lastOffsetDelta uint32
+}
+
+func scanRawBatches(data []byte) ([]batchBounds, error) {
+	var bounds []batchBounds
+	var pos int64
+	for pos < int64(len(data)) {
+		size, lod, err := validateRawBatch(data[pos:])
+		if err != nil {
+			return nil, err
+		}
+		bounds = append(bounds, batchBounds{offset: pos, size: size, lastOffsetDelta: lod})
+		pos += size
+	}
+	return bounds, nil
+}
+
+func (s *Segment) AppendRawBatch(data []byte, leaderEpoch int32) (baseOffset uint64, pos int64, lastOffsetDelta uint32, err error) {
+	totalSize, lastOffsetDelta, err := validateRawBatch(data)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	if int64(len(data)) != totalSize {
+		return 0, 0, 0, fmt.Errorf("%w: first batch needs %d bytes, have %d",
+			ErrMultipleBatchesUnsupported, totalSize, len(data))
 	}
 
 	pos = s.currentSize.Load()
-	if pos+totalSize > s.maxSize {
+	if pos > 0 && pos+totalSize > s.maxSize {
 		return 0, 0, 0, ErrSegmentFull
 	}
 
@@ -449,6 +504,42 @@ func (s *Segment) AppendRawBatch(data []byte, leaderEpoch int32) (baseOffset uin
 	s.currentSize.Add(totalSize)
 
 	return assignedOffset, pos, lod, nil
+}
+
+func (s *Segment) AppendRawBatches(data []byte, bounds []batchBounds, leaderEpoch int32) (baseOffset uint64, pos int64, totalRecords uint64, err error) {
+	totalSize := int64(len(data))
+
+	pos = s.currentSize.Load()
+	if pos > 0 && pos+totalSize > s.maxSize {
+		return 0, 0, 0, ErrSegmentFull
+	}
+
+	// TODO copying for now so i dont mutate the callers network buffer but take 2nd look
+	buf := make([]byte, totalSize)
+	copy(buf, data)
+
+	assignedOffset := s.nextOffset.Load()
+	offset := assignedOffset
+	for _, b := range bounds {
+		binary.BigEndian.PutUint64(buf[b.offset:b.offset+8], offset)                  // baseOffset - before CRC region
+		binary.BigEndian.PutUint32(buf[b.offset+12:b.offset+16], uint32(leaderEpoch)) // leaderEpoch - before CRC region
+
+		delta := uint64(b.lastOffsetDelta) + 1
+		if offset > math.MaxUint64-delta {
+			return 0, 0, 0, fmt.Errorf("%w: offset arithmetic overflow", ErrCorruptBatch)
+		}
+		offset += delta
+	}
+	totalRecords = offset - assignedOffset
+
+	if _, err := s.file.WriteAt(buf, pos); err != nil {
+		return 0, 0, 0, fmt.Errorf("AppendRawBatches: write at pos %d: %w", pos, err)
+	}
+
+	s.nextOffset.Add(totalRecords)
+	s.currentSize.Add(totalSize)
+
+	return assignedOffset, pos, totalRecords, nil
 }
 
 // used by internal/test read path

@@ -19,12 +19,14 @@ const (
 	defaultMaxSegmentBytes    = 1 << 30 // 1 gb
 	defaultMaxIndexBytes      = 1 << 20 // 1 mb
 	defaultIndexIntervalBytes = 4096    // 4 kb
+	defaultMaxMessageBytes = 1048588 // 1 mib + overhead
 )
 
 type LogConfig struct {
 	MaxSegmentBytes    int64 // max bytes per .log segment file before rolling (default 1gb)
 	MaxIndexBytes      int64 // max bytes per .index file (default 1mb)
 	IndexIntervalBytes int64 // min log bytes between index entries. lower = denser index (default 4096)
+	MaxMessageBytes int64
 }
 
 type segmentPair struct {
@@ -59,6 +61,9 @@ func applyDefaults(config *LogConfig) {
 	}
 	if config.IndexIntervalBytes <= 0 {
 		config.IndexIntervalBytes = defaultIndexIntervalBytes
+	}
+	if config.MaxMessageBytes <= 0 {
+		config.MaxMessageBytes = defaultMaxMessageBytes
 	}
 }
 

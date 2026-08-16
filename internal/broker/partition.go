@@ -12,7 +12,7 @@ import (
 	"github.com/berkaydemircin/Distributed-Messaging-System/internal/protocol"
 )
 
-type Acks int8
+type Acks int16
 
 const (
 	AcksNone   Acks = 0
@@ -24,13 +24,17 @@ const (
 type ErrorCode int16
 
 const (
-	ErrNone                    ErrorCode = 0
-	ErrOffsetOutOfRange        ErrorCode = 1
-	ErrUnknownTopicOrPartition ErrorCode = 3
-	ErrNotLeaderOrFollower     ErrorCode = 6
-	ErrRequestTimedOut         ErrorCode = 7
-	ErrUnsupportedVersion      ErrorCode = 35
-	ErrStorageError            ErrorCode = 56
+	ErrNone                        ErrorCode = 0
+	ErrOffsetOutOfRange            ErrorCode = 1
+	ErrCorruptMessage              ErrorCode = 2
+	ErrUnknownTopicOrPartition     ErrorCode = 3
+	ErrNotLeaderOrFollower         ErrorCode = 6
+	ErrRequestTimedOut             ErrorCode = 7
+	ErrMessageTooLarge             ErrorCode = 10
+	ErrInvalidRequiredAcks         ErrorCode = 21
+	ErrUnsupportedVersion          ErrorCode = 35
+	ErrUnsupportedForMessageFormat ErrorCode = 43
+	ErrStorageError                ErrorCode = 56
 )
 
 func (e ErrorCode) Error() string {
@@ -39,12 +43,20 @@ func (e ErrorCode) Error() string {
 		return "none"
 	case ErrOffsetOutOfRange:
 		return "offset out of range"
+	case ErrCorruptMessage:
+		return "corrupt message"
 	case ErrUnknownTopicOrPartition:
 		return "unknown topic or partition"
 	case ErrNotLeaderOrFollower:
 		return "not leader or follower"
 	case ErrRequestTimedOut:
 		return "request timed out"
+	case ErrMessageTooLarge:
+		return "message too large"
+	case ErrInvalidRequiredAcks:
+		return "invalid required acks"
+	case ErrUnsupportedForMessageFormat:
+		return "unsupported for message format"
 	case ErrStorageError:
 		return "storage error"
 	default:

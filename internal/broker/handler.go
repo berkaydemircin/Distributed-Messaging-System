@@ -71,24 +71,44 @@ func (h *Handler) handleProduce(header protocol.RequestHeader, body []byte) (ser
 		return nil, fmt.Errorf("decode produce v%d: %w", v, err)
 	}
 
+	// Validate the raw wire value before any conversion. This is on top of
+	// - not instead of - Acks now being int16 (matching the wire type
+	// exactly, which already makes the old truncation bug structurally
+	// impossible): a value like 5 is a real, in-range int16, just not one
+	// of the three acks levels that mean anything.
+	if req.Acks != -1 && req.Acks != 0 && req.Acks != 1 {
+		resp := &protocol.ProduceResponse{Topics: make([]protocol.ProduceResponseTopic, len(req.Topics))}
+		for ti, reqTopic := range req.Topics {
+			respTopic := &resp.Topics[ti]
+			respTopic.Name = reqTopic.Name
+			respTopic.Partitions = make([]protocol.ProduceResponsePartition, len(reqTopic.Partitions))
+			for pi, reqPart := range reqTopic.Partitions {
+				respPart := &respTopic.Partitions[pi]
+				respPart.Index = reqPart.Index
+				respPart.BaseOffset = -1
+				respPart.LogAppendTime = -1
+				respPart.LogStartOffset = -1
+				respPart.ErrorCode = int16(ErrInvalidRequiredAcks)
+			}
+		}
+		return server.BytesResponse(protocol.EncodeProduceResponse(resp, v)), nil
+	}
+
 	acks := Acks(req.Acks)
 
-	var (
-		ctx    context.Context
-		cancel context.CancelFunc
-	)
+	ctx := context.Background()
 
-	if acks == AcksAll && req.TimeoutMs > 0 {
-		ctx, cancel = context.WithTimeout(context.Background(),
-			time.Duration(req.TimeoutMs)*time.Millisecond)
+	if acks == AcksAll {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(
+			ctx,
+			time.Duration(req.TimeoutMs)*time.Millisecond,
+		)
 		defer cancel()
-	} else {
-		ctx = context.Background()
 	}
 
 	type pendingResult struct {
-		topicIdx int
-		partIdx  int
+		response *protocol.ProduceResponsePartition
 		result   AppendResult
 	}
 	var pending []pendingResult
@@ -121,11 +141,16 @@ func (h *Handler) handleProduce(header protocol.RequestHeader, body []byte) (ser
 
 			result, err := partition.AppendRaw(ctx, reqPart.Records, acks)
 			if err != nil {
+				var ec ErrorCode
+				if errors.As(err, &ec) {
+					respPart.ErrorCode = int16(ec)
+				} else {
+					respPart.ErrorCode = int16(ErrStorageError)
+				}
 				h.logger.Warn("append failed",
 					"topic", reqTopic.Name,
 					"partition", reqPart.Index,
 					"err", err)
-				respPart.ErrorCode = int16(ErrStorageError)
 				continue
 			}
 
@@ -134,8 +159,7 @@ func (h *Handler) handleProduce(header protocol.RequestHeader, body []byte) (ser
 
 			if acks == AcksAll {
 				pending = append(pending, pendingResult{
-					topicIdx: ti,
-					partIdx:  pi,
+					response: respPart,
 					result:   result,
 				})
 			}
@@ -148,10 +172,11 @@ func (h *Handler) handleProduce(header protocol.RequestHeader, body []byte) (ser
 	}
 
 	// acks=-1 waiting for ISRs
-	for _, p := range pending {
-		<-p.result.Done
-		if errFn := p.result.ErrFn(); errFn != nil {
-			resp.Topics[p.topicIdx].Partitions[p.partIdx].ErrorCode = int16(*errFn)
+	for _, pendingResult := range pending {
+		<-pendingResult.result.Done
+
+		if errCode := pendingResult.result.ErrFn(); errCode != nil {
+			pendingResult.response.ErrorCode = int16(*errCode)
 		}
 	}
 
@@ -350,7 +375,7 @@ func (h *Handler) handleListOffsets(header protocol.RequestHeader, body []byte) 
 
 			switch reqPart.Timestamp {
 			case -1: // latest
-				respPart.Offset = int64(partition.LEO())
+				respPart.Offset = int64(partition.HighWatermark())
 				respPart.Timestamp = -1
 			case -2: // earliest
 				respPart.Offset = int64(partition.log.OldestOffset())
