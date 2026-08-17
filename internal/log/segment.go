@@ -570,6 +570,36 @@ func (s *Segment) ReadBatchMetaAt(pos int64) (firstOffset uint64, lastOffsetDelt
 	return firstOffset, lastOffsetDelta, onDiskSize, nil
 }
 
+func (s *Segment) readBatchOffsetAndEpochAt(pos int64) (
+	firstOffset uint64,
+	leaderEpoch int32,
+	onDiskSize int64,
+	err error,
+) {
+	if pos < 0 {
+		return 0, 0, 0, fmt.Errorf("ReadBatchOffsetAndEpochAt: negative position %d", pos)
+	}
+
+	var header [16]byte
+	if _, err := s.file.ReadAt(header[:], pos); err != nil {
+		return 0, 0, 0, fmt.Errorf("ReadBatchOffsetAndEpochAt: read at %d: %w", pos, err)
+	}
+
+	firstOffset = binary.BigEndian.Uint64(header[0:8])
+	batchLength := int32(binary.BigEndian.Uint32(header[8:12]))
+	if batchLength < int32(recordBatchOverhead-12) {
+		return 0, 0, 0, fmt.Errorf(
+			"ReadBatchOffsetAndEpochAt: invalid batchLength %d at position %d",
+			batchLength,
+			pos,
+		)
+	}
+
+	leaderEpoch = int32(binary.BigEndian.Uint32(header[12:16]))
+	onDiskSize = 12 + int64(batchLength)
+	return firstOffset, leaderEpoch, onDiskSize, nil
+}
+
 func (s *Segment) ReadRawBatchAt(pos int64, maxBytes int32) ([]byte, uint64, error) {
 	segSize := s.currentSize.Load()
 	if pos >= segSize {
