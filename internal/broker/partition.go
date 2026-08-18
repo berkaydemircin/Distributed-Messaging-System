@@ -123,7 +123,7 @@ type Partition struct {
 
 	highWatermark atomic.Uint64
 	isLeader      atomic.Bool
-	leaderEpoch   uint32
+	leaderEpoch   int32
 	isr           []ISREntry // nil on followers only leader keeps track
 	isrMu         sync.RWMutex
 	appendMu      sync.Mutex
@@ -151,26 +151,58 @@ func NewPartition(topicName string, partitionID int32, localBrokerID int32, l *l
 	return p
 }
 
-// WARNING MakeLeader is for leadership transitions, not in place ISR updates.
-func (p *Partition) MakeLeader(epoch uint32, initialISR []int32, initialHW uint64) {
-	defer p.notifyWaiters()
+// WARNING MakeLeader is for leadership transitions, not in-place ISR updates.
+func (p *Partition) MakeLeader(epoch int32, initialISR []int32, initialHW uint64) error {
 	p.appendMu.Lock()
+	defer p.appendMu.Unlock()
+
+	if latest, ok := p.log.LatestLeaderEpoch(); ok && epoch < latest {
+		return fmt.Errorf(
+			"MakeLeader: requested epoch %d is older than current epoch %d",
+			epoch,
+			latest,
+		)
+	}
+
+	if !p.isLeader.Load() || epoch > p.LeaderEpoch() {
+		p.isLeader.Store(false)
+	}
+
+	leo := p.log.NextOffset()
+	if err := p.log.AssignLeaderEpoch(epoch, leo); err != nil {
+		p.isLeader.Store(false)
+
+		notLeader := ErrNotLeaderOrFollower
+		p.failPurgatory(&notLeader)
+		p.notifyWaiters()
+
+		return fmt.Errorf(
+			"MakeLeader: persist epoch %d at offset %d: %w",
+			epoch,
+			leo,
+			err,
+		)
+	}
 
 	p.isrMu.Lock()
 	p.leaderEpoch = epoch
 	p.isr = make([]ISREntry, len(initialISR))
 	for i, id := range initialISR {
-		p.isr[i] = ISREntry{BrokerID: id, LEO: 0}
+		p.isr[i] = ISREntry{
+			BrokerID: id,
+			LEO:      0,
+		}
 	}
 	p.isrMu.Unlock()
 
 	p.highWatermark.Store(initialHW)
 	p.isLeader.Store(true)
+	p.notifyWaiters()
 
-	p.appendMu.Unlock()
+	return nil
 }
 
-func (p *Partition) MakeFollower(epoch uint32, _ int32) {
+func (p *Partition) MakeFollower(epoch int32, _ int32) {
 	defer p.notifyWaiters()
 	p.appendMu.Lock()
 
@@ -439,7 +471,7 @@ func (p *Partition) notifyWaiters() {
 	p.notifyMu.Unlock()
 }
 
-func (p *Partition) LeaderEpoch() uint32 {
+func (p *Partition) LeaderEpoch() int32 {
 	p.isrMu.RLock()
 	defer p.isrMu.RUnlock()
 	return p.leaderEpoch

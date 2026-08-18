@@ -50,6 +50,10 @@ type Log struct {
 
 	activePair  atomic.Pointer[segmentPair]
 	sealedPairs atomic.Value
+
+	epochCache      *LeaderEpochCache
+	epochCheckpoint *EpochCheckpoint
+	epochMu         sync.Mutex
 }
 
 func applyDefaults(config *LogConfig) {
@@ -91,24 +95,50 @@ func NewLog(dir string, config LogConfig) (*Log, error) {
 			return nil, fmt.Errorf("create initial segment: %w", err)
 		}
 		l.activePair.Store(pair)
-		return l, nil
+	} else {
+		sealed := make([]*segmentPair, 0, len(baseOffsets)-1)
+
+		for i, offset := range baseOffsets {
+			pair, err := newSegmentPair(dir, offset, config)
+			if err != nil {
+				closeAll(sealed)
+				return nil, fmt.Errorf(
+					"open segment at offset %d: %w",
+					offset,
+					err,
+				)
+			}
+
+			if i < len(baseOffsets)-1 {
+				sealed = append(sealed, pair)
+			} else {
+				l.activePair.Store(pair)
+			}
+		}
+
+		l.sealedPairs.Store(sealed)
 	}
 
-	sealed := make([]*segmentPair, 0, len(baseOffsets)-1)
-	for i, offset := range baseOffsets {
-		pair, err := newSegmentPair(dir, offset, config)
-		if err != nil {
-			closeAll(sealed)
-			return nil, fmt.Errorf("open segment at offset %d: %w", offset, err)
-		}
-		if i < len(baseOffsets)-1 {
-			sealed = append(sealed, pair)
-		} else {
-			l.activePair.Store(pair)
-		}
-	}
-	l.sealedPairs.Store(sealed)
+	l.epochCheckpoint = NewEpochCheckpoint(
+		filepath.Join(dir, "leader-epoch-checkpoint"),
+	)
 
+	cache, err := l.RecoverEpochCache(l.epochCheckpoint)
+	if err != nil {
+		pairs := append(
+			[]*segmentPair(nil),
+			l.sealedPairs.Load().([]*segmentPair)...,
+		)
+		pairs = append(pairs, l.activePair.Load())
+		closeAll(pairs)
+
+		return nil, fmt.Errorf(
+			"recover leader epoch cache: %w",
+			err,
+		)
+	}
+
+	l.epochCache = cache
 	return l, nil
 }
 

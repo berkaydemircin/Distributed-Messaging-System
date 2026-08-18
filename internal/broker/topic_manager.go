@@ -107,8 +107,27 @@ func (tm *TopicManager) recoverFromDisk() error {
 				continue
 			}
 			p := NewPartition(topicName, int32(d.id), tm.localBrokerID, l)
-			// WARNING check recoverFromDisk (this method) comment, this only works for a single node configuration
-			p.MakeLeader(1, []int32{tm.localBrokerID}, l.NextOffset())
+
+			epoch, ok := l.LatestLeaderEpoch()
+			if !ok {
+				epoch = 1
+			}
+
+			if err := p.MakeLeader(
+				epoch,
+				[]int32{tm.localBrokerID},
+				l.NextOffset(),
+			); err != nil {
+				fmt.Printf(
+					"warn: partition %s-%d offline on recovery: MakeLeader: %v\n",
+					topicName,
+					d.id,
+					err,
+				)
+				_ = p.Close()
+				continue
+			}
+
 			partitions[d.id] = p
 		}
 
@@ -148,7 +167,25 @@ func (tm *TopicManager) CreateTopic(name string, numPartitions int, initialLeade
 		}
 		p := NewPartition(name, int32(i), tm.localBrokerID, l)
 		if initialLeader {
-			p.MakeLeader(1, []int32{tm.localBrokerID}, l.NextOffset())
+			if err := p.MakeLeader(1, []int32{tm.localBrokerID}, l.NextOffset()); err != nil {
+				_ = p.Close()
+
+				for j := 0; j < i; j++ {
+					if partitions[j] != nil {
+						_ = partitions[j].Close()
+					}
+					_ = os.RemoveAll(tm.partitionDir(name, j))
+				}
+
+				_ = os.RemoveAll(tm.partitionDir(name, i))
+
+				return fmt.Errorf(
+					"make leader for %s-%d: %w",
+					name,
+					i,
+					err,
+				)
+			}
 		}
 		partitions[i] = p
 	}

@@ -80,7 +80,7 @@ func (l *Log) RecoverEpochCache(checkpoint *EpochCheckpoint) (*LeaderEpochCache,
 	}
 
 	repaired := !epochEntriesEqual(loaded, cache.Entries())
-	cache.TruncateFromEnd(leo)
+	cache.TruncateAfter(leo)
 
 	usedScan := false
 	if leo > 0 && (repaired || len(cache.Entries()) == 0) {
@@ -93,7 +93,7 @@ func (l *Log) RecoverEpochCache(checkpoint *EpochCheckpoint) (*LeaderEpochCache,
 		if err != nil {
 			return nil, fmt.Errorf("RecoverEpochCache: replaying scanned history: %w", err)
 		}
-		cache.TruncateFromEnd(leo)
+		cache.TruncateAfter(leo)
 		usedScan = true
 	}
 

@@ -84,7 +84,7 @@ func (p *Partition) AppendRaw(ctx context.Context, data []byte, acks Acks) (Appe
 	var lod uint32
 	var err error
 
-	firstOffset, lod, err = p.log.AppendRaw(data, int32(epoch))
+	firstOffset, lod, err = p.log.AppendRaw(data, epoch)
 	if err != nil {
 		p.appendMu.Unlock()
 		switch {

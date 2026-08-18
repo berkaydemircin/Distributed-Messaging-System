@@ -392,7 +392,7 @@ func (h *Handler) handleMetadata(header protocol.RequestHeader, body []byte) (se
 			} else {
 				partResp.LeaderID = -1
 			}
-			partResp.LeaderEpoch = int32(p.LeaderEpoch())
+			partResp.LeaderEpoch = p.LeaderEpoch()
 
 			isr := p.ISRSnapshot()
 			partResp.ReplicaNodes = []int32{h.brokerID}
@@ -441,7 +441,7 @@ func (h *Handler) handleListOffsets(header protocol.RequestHeader, body []byte) 
 				respPart.Offset = -1
 				continue
 			}
-			respPart.LeaderEpoch = int32(partition.LeaderEpoch())
+			respPart.LeaderEpoch = partition.LeaderEpoch()
 
 			switch reqPart.Timestamp {
 			case -1: // latest
