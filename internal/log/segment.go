@@ -711,6 +711,33 @@ func (s *Segment) ReadRawRangesAt(pos int64, maxBytes int32) (ReadRawRangesResul
 	}, nil
 }
 
+func (s *Segment) truncateAt(position int64, nextOffset uint64) error {
+	if position < 0 {
+		return fmt.Errorf("truncateAt: negative position %d", position)
+	}
+	if nextOffset < s.baseOffset {
+		return fmt.Errorf(
+			"truncateAt: next offset %d is before segment base offset %d",
+			nextOffset,
+			s.baseOffset,
+		)
+	}
+	if position > s.currentSize.Load() {
+		return fmt.Errorf(
+			"truncateAt: position %d exceeds segment size %d",
+			position,
+			s.currentSize.Load(),
+		)
+	}
+	if err := s.file.Truncate(position); err != nil {
+		return fmt.Errorf("truncateAt: truncate file to %d: %w", position, err)
+	}
+
+	s.currentSize.Store(position)
+	s.nextOffset.Store(nextOffset)
+	return nil
+}
+
 func (s *Segment) IsFull() bool       { return s.currentSize.Load() >= s.maxSize }
 func (s *Segment) BaseOffset() uint64 { return s.baseOffset }
 func (s *Segment) NextOffset() uint64 { return s.nextOffset.Load() }

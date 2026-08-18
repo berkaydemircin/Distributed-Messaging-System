@@ -410,6 +410,40 @@ func (p *Partition) maybeAdvanceHW() {
 	p.notifyWaiters()
 }
 
+func (p *Partition) TruncateTo(offset uint64) error {
+	p.appendMu.Lock()
+	defer p.appendMu.Unlock()
+
+	if p.isLeader.Load() {
+		return fmt.Errorf("TruncateTo: refusing to truncate while serving as leader")
+	}
+
+	oldLEO := p.log.NextOffset()
+	truncateErr := p.log.TruncateTo(offset)
+	newLEO := p.log.NextOffset()
+	stateChanged := newLEO != oldLEO
+
+	for {
+		hw := p.highWatermark.Load()
+		if hw <= newLEO {
+			break
+		}
+		if p.highWatermark.CompareAndSwap(hw, newLEO) {
+			stateChanged = true
+			break
+		}
+	}
+
+	if stateChanged {
+		p.notifyWaiters()
+	}
+	if truncateErr != nil {
+		return fmt.Errorf("TruncateTo: %w", truncateErr)
+	}
+
+	return nil
+}
+
 // drain purgatory up to and including hw
 func (p *Partition) drainPurgatory(newHW uint64) {
 	p.purgatoryMu.Lock()
