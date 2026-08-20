@@ -51,9 +51,13 @@ type Log struct {
 	activePair  atomic.Pointer[segmentPair]
 	sealedPairs atomic.Value
 
-	epochCache      *LeaderEpochCache
-	epochCheckpoint *EpochCheckpoint
-	epochMu         sync.Mutex
+	epochCache           *LeaderEpochCache
+	epochCheckpoint      *EpochCheckpoint
+	epochMu              sync.Mutex
+	epochCheckpointDirty bool
+
+	// todo
+	removeFile func(path string) error
 }
 
 func applyDefaults(config *LogConfig) {
@@ -84,8 +88,9 @@ func NewLog(dir string, config LogConfig) (*Log, error) {
 	}
 
 	l := &Log{
-		dir:    dir,
-		config: config,
+		dir:        dir,
+		config:     config,
+		removeFile: os.Remove,
 	}
 	l.sealedPairs.Store([]*segmentPair{})
 

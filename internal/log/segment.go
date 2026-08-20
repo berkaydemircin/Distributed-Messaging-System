@@ -21,6 +21,18 @@ var ErrCorruptBatch = errors.New("corrupt or malformed record batch")
 var ErrMultipleBatchesUnsupported = errors.New("AppendRawBatch received more than one batch")
 var ErrUnsupportedMessageFormat = errors.New("unsupported record batch magic byte")
 
+// ErrUnexpectedAppendOffset is distinct from ErrCorruptBatch: it means the
+// bytes themselves are structurally valid, but don't line up with this
+// log's current end offset - a gap, an overlap, or a first offset that's
+// behind or ahead of local LEO. Confirmed against a real Kafka replica
+// fetcher log: kafka.common.UnexpectedAppendOffsetException, raised for
+// exactly this shape of mismatch. Unlike genuine corruption, this can mean
+// the fetch response was built against now-stale local state - the
+// follower may have truncated while the request was in flight - and the
+// right response is to re-run epoch reconciliation, not discard the data
+// as untrustworthy.
+var ErrUnexpectedAppendOffset = errors.New("unexpected replica append offset")
+
 var crc32cTable = crc32.MakeTable(crc32.Castagnoli)
 
 const (
@@ -456,6 +468,8 @@ type batchBounds struct {
 	offset          int64
 	size            int64
 	lastOffsetDelta uint32
+	baseOffset      uint64
+	leaderEpoch     int32
 }
 
 func scanRawBatches(data []byte) ([]batchBounds, error) {
@@ -466,7 +480,20 @@ func scanRawBatches(data []byte) ([]batchBounds, error) {
 		if err != nil {
 			return nil, err
 		}
-		bounds = append(bounds, batchBounds{offset: pos, size: size, lastOffsetDelta: lod})
+
+		rawOffset := int64(binary.BigEndian.Uint64(data[pos : pos+8]))
+		if rawOffset < 0 {
+			return nil, fmt.Errorf("%w: base offset %d is negative", ErrCorruptBatch, rawOffset)
+		}
+		leaderEpoch := int32(binary.BigEndian.Uint32(data[pos+12 : pos+16]))
+
+		bounds = append(bounds, batchBounds{
+			offset:          pos,
+			size:            size,
+			lastOffsetDelta: lod,
+			baseOffset:      uint64(rawOffset),
+			leaderEpoch:     leaderEpoch,
+		})
 		pos += size
 	}
 	return bounds, nil
@@ -507,6 +534,14 @@ func (s *Segment) AppendRawBatch(data []byte, leaderEpoch int32) (baseOffset uin
 }
 
 func (s *Segment) AppendRawBatches(data []byte, bounds []batchBounds, leaderEpoch int32) (baseOffset uint64, pos int64, totalRecords uint64, err error) {
+	return s.appendRawBatches(data, bounds, leaderEpoch, true)
+}
+
+func (s *Segment) AppendReplicaBatches(data []byte, bounds []batchBounds) (baseOffset uint64, pos int64, totalRecords uint64, err error) {
+	return s.appendRawBatches(data, bounds, 0, false)
+}
+
+func (s *Segment) appendRawBatches(data []byte, bounds []batchBounds, leaderEpoch int32, assignOffsets bool) (baseOffset uint64, pos int64, totalRecords uint64, err error) {
 	totalSize := int64(len(data))
 
 	pos = s.currentSize.Load()
@@ -518,11 +553,23 @@ func (s *Segment) AppendRawBatches(data []byte, bounds []batchBounds, leaderEpoc
 	buf := make([]byte, totalSize)
 	copy(buf, data)
 
-	assignedOffset := s.nextOffset.Load()
+	var assignedOffset uint64
+	if assignOffsets {
+		assignedOffset = s.nextOffset.Load()
+	} else {
+		// Preserve whatever the leader already assigned: the first
+		// accepted batch's own base offset. Callers validate this
+		// matches the segment's own tracked next offset before ever
+		// reaching here.
+		assignedOffset = bounds[0].baseOffset
+	}
+
 	offset := assignedOffset
 	for _, b := range bounds {
-		binary.BigEndian.PutUint64(buf[b.offset:b.offset+8], offset)                  // baseOffset - before CRC region
-		binary.BigEndian.PutUint32(buf[b.offset+12:b.offset+16], uint32(leaderEpoch)) // leaderEpoch - before CRC region
+		if assignOffsets {
+			binary.BigEndian.PutUint64(buf[b.offset:b.offset+8], offset)                  // baseOffset - before CRC region
+			binary.BigEndian.PutUint32(buf[b.offset+12:b.offset+16], uint32(leaderEpoch)) // leaderEpoch - before CRC region
+		}
 
 		delta := uint64(b.lastOffsetDelta) + 1
 		if offset > math.MaxUint64-delta {
@@ -533,7 +580,7 @@ func (s *Segment) AppendRawBatches(data []byte, bounds []batchBounds, leaderEpoc
 	totalRecords = offset - assignedOffset
 
 	if _, err := s.file.WriteAt(buf, pos); err != nil {
-		return 0, 0, 0, fmt.Errorf("AppendRawBatches: write at pos %d: %w", pos, err)
+		return 0, 0, 0, fmt.Errorf("appendRawBatches: write at pos %d: %w", pos, err)
 	}
 
 	s.nextOffset.Add(totalRecords)

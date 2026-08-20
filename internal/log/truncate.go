@@ -71,7 +71,7 @@ func (l *Log) TruncateTo(offset uint64) error {
 			l.activePair.Store(target)
 
 			for _, pair := range toRemove {
-				if err := closeAndRemovePair(l.dir, pair); err != nil {
+				if err := l.closeAndRemovePair(pair); err != nil {
 					cleanupErr = errors.Join(cleanupErr, err)
 				}
 			}
@@ -80,9 +80,11 @@ func (l *Log) TruncateTo(offset uint64) error {
 
 	l.epochMu.Lock()
 	if needsPhysicalTruncation {
-		l.epochCache.TruncateFromEnd(offset)
+		if changed := l.epochCache.TruncateFromEnd(offset); changed {
+			l.epochCheckpointDirty = true
+		}
 	}
-	persistErr := l.epochCheckpoint.Write(l.epochCache.Entries())
+	persistErr := l.persistEpochCheckpointLocked()
 	l.epochMu.Unlock()
 
 	if persistErr != nil {
@@ -169,7 +171,7 @@ func findTruncationPosition(seg *Segment, offset uint64) (int64, error) {
 	)
 }
 
-func closeAndRemovePair(dir string, pair *segmentPair) error {
+func (l *Log) closeAndRemovePair(pair *segmentPair) error {
 	baseOffset := pair.segment.BaseOffset()
 	var errs []error
 
@@ -180,13 +182,13 @@ func closeAndRemovePair(dir string, pair *segmentPair) error {
 		errs = append(errs, fmt.Errorf("close segment %d: %w", baseOffset, err))
 	}
 
-	logPath := filepath.Join(dir, fmt.Sprintf("%020d.log", baseOffset))
-	if err := os.Remove(logPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+	logPath := filepath.Join(l.dir, fmt.Sprintf("%020d.log", baseOffset))
+	if err := l.removeFile(logPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 		errs = append(errs, fmt.Errorf("remove segment file %d: %w", baseOffset, err))
 	}
 
-	indexPath := filepath.Join(dir, fmt.Sprintf("%020d.index", baseOffset))
-	if err := os.Remove(indexPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+	indexPath := filepath.Join(l.dir, fmt.Sprintf("%020d.index", baseOffset))
+	if err := l.removeFile(indexPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 		errs = append(errs, fmt.Errorf("remove index file %d: %w", baseOffset, err))
 	}
 

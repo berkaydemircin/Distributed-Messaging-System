@@ -35,6 +35,8 @@ const (
 	ErrUnsupportedVersion          ErrorCode = 35
 	ErrUnsupportedForMessageFormat ErrorCode = 43
 	ErrStorageError                ErrorCode = 56
+	ErrFencedLeaderEpoch           ErrorCode = 74
+	ErrUnknownLeaderEpoch          ErrorCode = 75
 )
 
 func (e ErrorCode) Error() string {
@@ -59,6 +61,10 @@ func (e ErrorCode) Error() string {
 		return "unsupported for message format"
 	case ErrStorageError:
 		return "storage error"
+	case ErrFencedLeaderEpoch:
+		return "fenced leader epoch"
+	case ErrUnknownLeaderEpoch:
+		return "unknown leader epoch"
 	default:
 		return fmt.Sprintf("error code %d", int16(e))
 	}
@@ -124,6 +130,7 @@ type Partition struct {
 	highWatermark atomic.Uint64
 	isLeader      atomic.Bool
 	leaderEpoch   int32
+	leaderID      int32      // -1 when unassigned, MakeLeader sets it to localBrokerID, MakeFollower to the remote leaders broker ID
 	isr           []ISREntry // nil on followers only leader keeps track
 	isrMu         sync.RWMutex
 	appendMu      sync.Mutex
@@ -142,6 +149,7 @@ func NewPartition(topicName string, partitionID int32, localBrokerID int32, l *l
 		topicName:     topicName,
 		partitionID:   partitionID,
 		localBrokerID: localBrokerID,
+		leaderID:      -1,
 		log:           l,
 		closed:        make(chan struct{}),
 		notifyCh:      make(chan struct{}),
@@ -172,6 +180,11 @@ func (p *Partition) MakeLeader(epoch int32, initialISR []int32, initialHW uint64
 	if err := p.log.AssignLeaderEpoch(epoch, leo); err != nil {
 		p.isLeader.Store(false)
 
+		p.isrMu.Lock()
+		p.leaderID = -1
+		p.isr = nil
+		p.isrMu.Unlock()
+
 		notLeader := ErrNotLeaderOrFollower
 		p.failPurgatory(&notLeader)
 		p.notifyWaiters()
@@ -186,6 +199,7 @@ func (p *Partition) MakeLeader(epoch int32, initialISR []int32, initialHW uint64
 
 	p.isrMu.Lock()
 	p.leaderEpoch = epoch
+	p.leaderID = p.localBrokerID
 	p.isr = make([]ISREntry, len(initialISR))
 	for i, id := range initialISR {
 		p.isr[i] = ISREntry{
@@ -202,7 +216,7 @@ func (p *Partition) MakeLeader(epoch int32, initialISR []int32, initialHW uint64
 	return nil
 }
 
-func (p *Partition) MakeFollower(epoch int32, _ int32) {
+func (p *Partition) MakeFollower(epoch int32, leaderID int32) {
 	defer p.notifyWaiters()
 	p.appendMu.Lock()
 
@@ -210,6 +224,7 @@ func (p *Partition) MakeFollower(epoch int32, _ int32) {
 
 	p.isrMu.Lock()
 	p.leaderEpoch = epoch
+	p.leaderID = leaderID
 	p.isr = nil
 	p.isrMu.Unlock()
 

@@ -56,6 +56,96 @@ func (l *Log) AppendRaw(data []byte, leaderEpoch int32) (baseOffset uint64, last
 	return assignedOffset, uint32(totalRecords - 1), nil
 }
 
+func (l *Log) AppendReplicaRaw(data []byte, fetchEpoch int32) (acceptedRecords uint64, err error) {
+	bounds, err := scanRawBatches(data)
+	if err != nil {
+		return 0, err
+	}
+	if len(bounds) == 0 {
+		return 0, fmt.Errorf("%w: empty records", ErrCorruptBatch)
+	}
+
+	acceptedBounds := bounds
+	acceptedBytes := data
+	for i, b := range bounds {
+		if b.leaderEpoch > fetchEpoch {
+			acceptedBounds = bounds[:i]
+			if b.offset < 0 {
+				return 0, fmt.Errorf("%w: negative batch offset", ErrCorruptBatch)
+			}
+			acceptedBytes = data[:int(b.offset)]
+			break
+		}
+	}
+
+	l.writeMu.Lock()
+	defer l.writeMu.Unlock()
+
+	if len(acceptedBounds) == 0 {
+		return 0, nil
+	}
+
+	leo := l.NextOffset()
+	first := acceptedBounds[0]
+	if first.baseOffset != leo {
+		return 0, fmt.Errorf("%w: first accepted batch base offset %d does not match local end offset %d",
+			ErrUnexpectedAppendOffset, first.baseOffset, leo)
+	}
+
+	transitions := make([]EpochEntry, 0, 1)
+	for i, b := range acceptedBounds {
+		if i > 0 {
+			prev := acceptedBounds[i-1]
+			expectedNext := prev.baseOffset + uint64(prev.lastOffsetDelta) + 1
+			if b.baseOffset != expectedNext {
+				return 0, fmt.Errorf("%w: batch %d/%d expected base offset %d, got %d (gap or overlap)",
+					ErrUnexpectedAppendOffset, i+1, len(acceptedBounds), expectedNext, b.baseOffset)
+			}
+			if b.leaderEpoch < prev.leaderEpoch {
+				return 0, fmt.Errorf("%w: batch %d/%d epoch %d is older than previous batch's epoch %d",
+					ErrCorruptBatch, i+1, len(acceptedBounds), b.leaderEpoch, prev.leaderEpoch)
+			}
+		}
+		if i == 0 || b.leaderEpoch != acceptedBounds[i-1].leaderEpoch {
+			transitions = append(transitions, EpochEntry{Epoch: b.leaderEpoch, StartOffset: b.baseOffset})
+		}
+	}
+
+	if err := l.assignLeaderEpochs(transitions); err != nil {
+		return 0, fmt.Errorf("AppendReplicaRaw: %w", err)
+	}
+
+	active := l.activePair.Load()
+	if active.segment.IsFull() || active.index.IsFull() {
+		active, err = l.roll()
+		if err != nil {
+			return 0, fmt.Errorf("AppendReplicaRaw: roll: %w", err)
+		}
+	}
+
+	assignedOffset, pos, totalRecords, aErr := active.segment.AppendReplicaBatches(acceptedBytes, acceptedBounds)
+	if errors.Is(aErr, ErrSegmentFull) {
+		active, err = l.roll()
+		if err != nil {
+			return 0, fmt.Errorf("AppendReplicaRaw: roll after full: %w", err)
+		}
+		assignedOffset, pos, totalRecords, aErr = active.segment.AppendReplicaBatches(acceptedBytes, acceptedBounds)
+	}
+	if aErr != nil {
+		return 0, fmt.Errorf("AppendReplicaRaw: %w", aErr)
+	}
+
+	active.bytesSinceIndex += int64(len(acceptedBytes))
+	if pos == 0 || active.bytesSinceIndex >= l.config.IndexIntervalBytes {
+		if err := active.index.Write(assignedOffset, pos); err != nil {
+			return 0, fmt.Errorf("AppendReplicaRaw: index write: %w", err)
+		}
+		active.bytesSinceIndex = 0
+	}
+
+	return totalRecords, nil
+}
+
 func (l *Log) ReadRaw(offset uint64, maxBytes int32) ([]byte, uint64, error) {
 	active := l.activePair.Load()
 	sealed := l.sealedPairs.Load().([]*segmentPair)

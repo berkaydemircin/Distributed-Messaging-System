@@ -173,6 +173,58 @@ func (p *Partition) AppendRaw(ctx context.Context, data []byte, acks Acks) (Appe
 	return AppendResult{}, fmt.Errorf("AppendRaw: unknown acks value: %d", acks)
 }
 
+func (p *Partition) AppendFromLeader(data []byte, fetchEpoch int32, leaderHW uint64) error {
+	p.appendMu.Lock()
+	defer p.appendMu.Unlock()
+
+	select {
+	case <-p.closed:
+		return ErrPartitionClosed
+	default:
+	}
+
+	p.isrMu.RLock()
+	currentEpoch := p.leaderEpoch
+	currentLeaderID := p.leaderID
+	p.isrMu.RUnlock()
+
+	if p.isLeader.Load() || currentLeaderID < 0 || currentLeaderID == p.localBrokerID {
+		return ErrNotLeaderOrFollower
+	}
+
+	switch {
+	case fetchEpoch < currentEpoch:
+		return ErrFencedLeaderEpoch
+	case fetchEpoch > currentEpoch:
+		return ErrUnknownLeaderEpoch
+	}
+
+	oldLEO := p.log.NextOffset()
+	oldHW := p.highWatermark.Load()
+
+	if len(data) > 0 {
+		if _, err := p.log.AppendReplicaRaw(data, fetchEpoch); err != nil {
+			return fmt.Errorf("AppendFromLeader: %w", err)
+		}
+	}
+
+	candidateHW := leaderHW
+	if leo := p.log.NextOffset(); leo < candidateHW {
+		candidateHW = leo
+	}
+	if candidateHW > oldHW {
+		p.highWatermark.Store(candidateHW)
+	}
+
+	newLEO := p.log.NextOffset()
+	newHW := p.highWatermark.Load()
+	if newLEO != oldLEO || newHW != oldHW {
+		p.notifyWaiters()
+	}
+
+	return nil
+}
+
 // replicaID = -1 for consumers, broker ID for followers.
 func (p *Partition) FetchRaw(fetchOffset uint64, replicaID int32, maxBytes int32) (FetchRawResult, error) {
 	select {
