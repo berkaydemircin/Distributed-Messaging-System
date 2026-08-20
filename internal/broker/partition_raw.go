@@ -225,6 +225,44 @@ func (p *Partition) AppendFromLeader(data []byte, fetchEpoch int32, leaderHW uin
 	return nil
 }
 
+// validateLeaderEpoch ignores negative sentinel epochs (>=0 are valid)
+func validateLeaderEpoch(requested, current int32) error {
+	if requested < 0 {
+		return nil
+	}
+	if requested < current {
+		return ErrFencedLeaderEpoch
+	}
+	if requested > current {
+		return ErrUnknownLeaderEpoch
+	}
+	return nil
+}
+
+// EndOffsetForLeaderEpoch returns the end offset for an epoch on the leader
+func (p *Partition) EndOffsetForLeaderEpoch(requestedEpoch int32, currentLeaderEpoch int32) (result storagelog.EpochEndOffset, found bool, err error) {
+	select {
+	case <-p.closed:
+		return storagelog.EpochEndOffset{}, false, ErrPartitionClosed
+	default:
+	}
+
+	if !p.isLeader.Load() {
+		return storagelog.EpochEndOffset{}, false, ErrNotLeaderOrFollower
+	}
+
+	p.isrMu.RLock()
+	current := p.leaderEpoch
+	p.isrMu.RUnlock()
+
+	if err := validateLeaderEpoch(currentLeaderEpoch, current); err != nil {
+		return storagelog.EpochEndOffset{}, false, err
+	}
+
+	result, found = p.log.EndOffsetForLeaderEpoch(requestedEpoch)
+	return result, found, nil
+}
+
 // replicaID = -1 for consumers, broker ID for followers.
 func (p *Partition) FetchRaw(fetchOffset uint64, replicaID int32, maxBytes int32) (FetchRawResult, error) {
 	select {

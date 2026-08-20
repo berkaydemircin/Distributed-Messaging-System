@@ -1,11 +1,12 @@
 package protocol
 
 const (
-	APIKeyProduce     int16 = 0
-	APIKeyFetch       int16 = 1
-	APIKeyListOffsets int16 = 2
-	APIKeyMetadata    int16 = 3
-	APIKeyApiVersions int16 = 18
+	APIKeyProduce               int16 = 0
+	APIKeyFetch                 int16 = 1
+	APIKeyListOffsets           int16 = 2
+	APIKeyMetadata              int16 = 3
+	APIKeyOffsetsForLeaderEpoch int16 = 23
+	APIKeyApiVersions           int16 = 18
 )
 
 const (
@@ -25,6 +26,7 @@ var SupportedAPIVersions = []APIVersion{
 	{APIKeyFetch, 4, 11},
 	{APIKeyListOffsets, 1, 5},
 	{APIKeyMetadata, 0, 8},
+	{APIKeyOffsetsForLeaderEpoch, 2, 4},
 	{APIKeyApiVersions, 0, 3},
 }
 
@@ -47,6 +49,10 @@ func RequestHeaderVersion(apiKey, apiVersion int16) int16 {
 		if apiVersion >= 9 {
 			return 2
 		}
+	case APIKeyOffsetsForLeaderEpoch:
+		if apiVersion >= 4 {
+			return 2
+		}
 	}
 	return 1
 }
@@ -66,6 +72,10 @@ func ResponseHeaderVersion(apiKey, apiVersion int16) int16 {
 		}
 	case APIKeyMetadata:
 		if apiVersion >= 9 {
+			return 1
+		}
+	case APIKeyOffsetsForLeaderEpoch:
+		if apiVersion >= 4 {
 			return 1
 		}
 	}

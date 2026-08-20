@@ -39,6 +39,8 @@ func (h *Handler) Handle(header protocol.RequestHeader, body []byte) (server.Res
 		return h.handleFetch(header, body)
 	case protocol.APIKeyListOffsets:
 		return h.handleListOffsets(header, body)
+	case protocol.APIKeyOffsetsForLeaderEpoch:
+		return h.handleOffsetsForLeaderEpoch(header, body)
 	case protocol.APIKeyMetadata:
 		return h.handleMetadata(header, body)
 	default:
@@ -244,6 +246,26 @@ func (h *Handler) fetchOnePass(req *protocol.FetchRequest) (resp *fetchStreamRes
 				continue
 			}
 
+			if !partition.IsLeader() {
+				respPart.errorCode = int16(ErrNotLeaderOrFollower)
+				respPart.recordsSize = 0
+				hasError = true
+				continue
+			}
+
+			currentEpoch := partition.LeaderEpoch()
+			if err := validateLeaderEpoch(reqPart.CurrentLeaderEpoch, currentEpoch); err != nil {
+				var ec ErrorCode
+				if errors.As(err, &ec) {
+					respPart.errorCode = int16(ec)
+				} else {
+					respPart.errorCode = int16(ErrStorageError)
+				}
+				respPart.recordsSize = 0
+				hasError = true
+				continue
+			}
+
 			ch := partition.NotifyChan()
 
 			partMax := reqPart.MaxBytes
@@ -434,14 +456,30 @@ func (h *Handler) handleListOffsets(header protocol.RequestHeader, body []byte) 
 			respPart := &respTopic.Partitions[pi]
 			respPart.Index = reqPart.Index
 			respPart.Timestamp = -1
+			respPart.Offset = -1
+			respPart.LeaderEpoch = -1
 
 			partition, errCode := h.topics.GetPartition(reqTopic.Name, reqPart.Index)
 			if errCode != ErrNone {
 				respPart.ErrorCode = int16(errCode)
-				respPart.Offset = -1
 				continue
 			}
-			respPart.LeaderEpoch = partition.LeaderEpoch()
+			if !partition.IsLeader() {
+				respPart.ErrorCode = int16(ErrNotLeaderOrFollower)
+				continue
+			}
+
+			currentEpoch := partition.LeaderEpoch()
+			if err := validateLeaderEpoch(reqPart.CurrentLeaderEpoch, currentEpoch); err != nil {
+				var ec ErrorCode
+				if errors.As(err, &ec) {
+					respPart.ErrorCode = int16(ec)
+				} else {
+					respPart.ErrorCode = int16(ErrStorageError)
+				}
+				continue
+			}
+			respPart.LeaderEpoch = currentEpoch
 
 			switch reqPart.Timestamp {
 			case -1: // latest
@@ -459,4 +497,58 @@ func (h *Handler) handleListOffsets(header protocol.RequestHeader, body []byte) 
 	}
 
 	return server.BytesResponse(protocol.EncodeListOffsetsResponse(resp, v)), nil
+}
+
+func (h *Handler) handleOffsetsForLeaderEpoch(header protocol.RequestHeader, body []byte) (server.Response, error) {
+	v := header.APIVersion
+	if v < 2 || v > 4 {
+		return h.encodeUnsupportedVersionError(header), nil
+	}
+
+	req, err := protocol.DecodeOffsetsForLeaderEpochRequest(body, v)
+	if err != nil {
+		return nil, fmt.Errorf("decode offsets_for_leader_epoch v%d: %w", v, err)
+	}
+
+	resp := &protocol.OffsetsForLeaderEpochResponse{
+		Topics: make([]protocol.OffsetsForLeaderEpochResponseTopic, len(req.Topics)),
+	}
+
+	for ti, reqTopic := range req.Topics {
+		respTopic := &resp.Topics[ti]
+		respTopic.Name = reqTopic.Name
+		respTopic.Partitions = make([]protocol.OffsetsForLeaderEpochResponsePartition, len(reqTopic.Partitions))
+
+		for pi, reqPart := range reqTopic.Partitions {
+			respPart := &respTopic.Partitions[pi]
+			respPart.Index = reqPart.Index
+			respPart.LeaderEpoch = -1
+			respPart.EndOffset = -1
+
+			partition, errCode := h.topics.GetPartition(reqTopic.Name, reqPart.Index)
+			if errCode != ErrNone {
+				respPart.ErrorCode = int16(errCode)
+				continue
+			}
+
+			result, found, err := partition.EndOffsetForLeaderEpoch(reqPart.LeaderEpoch, reqPart.CurrentLeaderEpoch)
+			if err != nil {
+				var ec ErrorCode
+				if errors.As(err, &ec) {
+					respPart.ErrorCode = int16(ec)
+				} else {
+					respPart.ErrorCode = int16(ErrStorageError)
+				}
+				continue
+			}
+			if !found {
+				continue
+			}
+
+			respPart.LeaderEpoch = result.Epoch
+			respPart.EndOffset = int64(result.EndOffset)
+		}
+	}
+
+	return server.BytesResponse(protocol.EncodeOffsetsForLeaderEpochResponse(resp, v)), nil
 }
