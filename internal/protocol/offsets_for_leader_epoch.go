@@ -32,6 +32,54 @@ func decodeOFLEString(d *Decoder, flexible bool) string {
 	return d.String()
 }
 
+func encodeOFLEArrayLen(e *Encoder, n int, flexible bool) {
+	if flexible {
+		e.PutCompactArrayLen(n)
+	} else {
+		e.PutArrayLen(int32(n))
+	}
+}
+
+func encodeOFLEString(e *Encoder, s string, flexible bool) {
+	if flexible {
+		e.PutCompactString(s)
+	} else {
+		e.PutString(s)
+	}
+}
+
+func EncodeOffsetsForLeaderEpochRequest(req *OffsetsForLeaderEpochRequest, apiVersion int16) []byte {
+	flexible := apiVersion >= 4
+	e := NewEncoder(128)
+
+	if apiVersion >= 3 {
+		e.PutInt32(req.ReplicaID)
+	}
+
+	encodeOFLEArrayLen(e, len(req.Topics), flexible)
+	for _, t := range req.Topics {
+		encodeOFLEString(e, t.Name, flexible)
+
+		encodeOFLEArrayLen(e, len(t.Partitions), flexible)
+		for _, p := range t.Partitions {
+			e.PutInt32(p.Index)
+			e.PutInt32(p.CurrentLeaderEpoch)
+			e.PutInt32(p.LeaderEpoch)
+			if flexible {
+				e.PutTaggedFields()
+			}
+		}
+		if flexible {
+			e.PutTaggedFields()
+		}
+	}
+	if flexible {
+		e.PutTaggedFields()
+	}
+
+	return e.Bytes()
+}
+
 func DecodeOffsetsForLeaderEpochRequest(body []byte, apiVersion int16) (*OffsetsForLeaderEpochRequest, error) {
 	d := NewDecoder(body)
 	flexible := apiVersion >= 4
@@ -129,4 +177,42 @@ func EncodeOffsetsForLeaderEpochResponse(resp *OffsetsForLeaderEpochResponse, ap
 	}
 
 	return e.Bytes()
+}
+
+func DecodeOffsetsForLeaderEpochResponse(body []byte, apiVersion int16) (*OffsetsForLeaderEpochResponse, error) {
+	flexible := apiVersion >= 4
+	d := NewDecoder(body)
+	resp := &OffsetsForLeaderEpochResponse{}
+
+	resp.ThrottleTimeMs = d.Int32()
+
+	numTopics := decodeOFLEArrayLen(d, flexible)
+	resp.Topics = make([]OffsetsForLeaderEpochResponseTopic, numTopics)
+	for i := range resp.Topics {
+		resp.Topics[i].Name = decodeOFLEString(d, flexible)
+
+		numParts := decodeOFLEArrayLen(d, flexible)
+		resp.Topics[i].Partitions = make([]OffsetsForLeaderEpochResponsePartition, numParts)
+		for j := range resp.Topics[i].Partitions {
+			p := &resp.Topics[i].Partitions[j]
+			p.ErrorCode = d.Int16()
+			p.Index = d.Int32()
+			p.LeaderEpoch = d.Int32()
+			p.EndOffset = d.Int64()
+			if flexible {
+				d.DiscardTaggedFields()
+			}
+		}
+		if flexible {
+			d.DiscardTaggedFields()
+		}
+	}
+	if flexible {
+		d.DiscardTaggedFields()
+	}
+
+	if d.Error() != nil {
+		return nil, d.Error()
+	}
+	return resp, nil
 }

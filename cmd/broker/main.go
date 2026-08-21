@@ -57,7 +57,10 @@ func main() {
 		os.Exit(1)
 	}
 
-	b.Start()
+	if err := b.Start(); err != nil {
+		fmt.Fprintf(os.Stderr, "fatal: start: %v\n", err)
+		os.Exit(1)
+	}
 
 	logger.Info("broker ready", "addr", b.Addr())
 

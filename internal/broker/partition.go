@@ -233,6 +233,47 @@ func (p *Partition) MakeFollower(epoch int32, leaderID int32) {
 	p.failPurgatory(&notLeader) // clean purgatory of now follower (old leader)
 }
 
+// Removes the partitions serving role without deleting its log
+func (p *Partition) MakeUnassigned() {
+	p.appendMu.Lock()
+	p.isLeader.Store(false)
+
+	p.isrMu.Lock()
+	p.leaderID = -1
+	p.isr = nil
+	p.isrMu.Unlock()
+	p.appendMu.Unlock()
+
+	notLeader := ErrNotLeaderOrFollower
+	p.failPurgatory(&notLeader)
+	p.notifyWaiters()
+}
+
+func (p *Partition) UpdateLeaderISR(epoch int32, ids []int32) error {
+	p.appendMu.Lock()
+	defer p.appendMu.Unlock()
+
+	p.isrMu.Lock()
+	if !p.isLeader.Load() || p.leaderEpoch != epoch || p.leaderID != p.localBrokerID {
+		p.isrMu.Unlock()
+		return ErrNotLeaderOrFollower
+	}
+
+	previous := make(map[int32]uint64, len(p.isr))
+	for _, entry := range p.isr {
+		previous[entry.BrokerID] = entry.LEO
+	}
+	next := make([]ISREntry, len(ids))
+	for i, id := range ids {
+		next[i] = ISREntry{BrokerID: id, LEO: previous[id]}
+	}
+	p.isr = next
+	p.isrMu.Unlock()
+
+	p.maybeAdvanceHW()
+	return nil
+}
+
 // TODO implement hierarchical timing wheel after benchmarking <- on ctx cancel, read confluent write up on it
 func (p *Partition) Append(ctx context.Context, batch *protocol.Batch, acks Acks) (AppendResult, error) {
 
@@ -506,6 +547,12 @@ func (p *Partition) Close() error {
 func (p *Partition) HighWatermark() uint64 { return p.highWatermark.Load() }
 func (p *Partition) LEO() uint64           { return p.log.NextOffset() }
 func (p *Partition) IsLeader() bool        { return p.isLeader.Load() }
+
+func (p *Partition) Assignment() (leaderID, leaderEpoch int32, isLeader bool) {
+	p.isrMu.RLock()
+	defer p.isrMu.RUnlock()
+	return p.leaderID, p.leaderEpoch, p.isLeader.Load()
+}
 
 func (p *Partition) NotifyChan() <-chan struct{} {
 	p.notifyMu.RLock()

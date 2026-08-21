@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"strings"
 	"sync"
 
 	"github.com/hashicorp/raft"
@@ -13,11 +14,21 @@ import (
 
 var _ raft.FSM = (*ControllerFSM)(nil)
 
+const SecurityProtocolPlaintext int16 = 0
+
+type BrokerEndpoint struct {
+	Name             string `json:"name"`
+	Host             string `json:"host"`
+	Port             uint16 `json:"port"`
+	SecurityProtocol int16  `json:"security_protocol"`
+}
+
 // BrokerInfo tracks a registered broker.
 type BrokerInfo struct {
 	ID            int32
 	IncarnationID string
 	BrokerEpoch   uint64
+	Endpoints     []BrokerEndpoint
 	Fenced        bool
 }
 
@@ -59,7 +70,9 @@ func newControllerState() controllerState {
 func (s controllerState) deepCopy() controllerState {
 	out := newControllerState()
 	for id, b := range s.Brokers {
-		out.Brokers[id] = b
+		cp := b
+		cp.Endpoints = append([]BrokerEndpoint(nil), b.Endpoints...)
+		out.Brokers[id] = cp
 	}
 	for name, t := range s.Topics {
 		out.Topics[name] = t
@@ -108,8 +121,9 @@ func EncodeCommand(cmdType CommandType, payload interface{}) ([]byte, error) {
 
 // RegisterBrokerCommand registers a broker incarnation.
 type RegisterBrokerCommand struct {
-	ID            int32  `json:"id"`
-	IncarnationID string `json:"incarnation_id"`
+	ID            int32            `json:"id"`
+	IncarnationID string           `json:"incarnation_id"`
+	Endpoints     []BrokerEndpoint `json:"endpoints"`
 }
 
 // UnfenceBrokerCommand activates a registered broker.
@@ -198,9 +212,16 @@ func (f *ControllerFSM) applyRegisterBroker(payload json.RawMessage, logIndex ui
 	if logIndex == 0 {
 		return fmt.Errorf("register broker: invalid broker epoch 0")
 	}
+	endpoints, err := normalizeEndpoints(cmd.Endpoints)
+	if err != nil {
+		return fmt.Errorf("register broker: %w", err)
+	}
 
 	if existing, ok := f.state.Brokers[cmd.ID]; ok {
 		if existing.IncarnationID == cmd.IncarnationID {
+			if !endpointsEqual(existing.Endpoints, endpoints) {
+				return fmt.Errorf("register broker: incarnation %s already registered with different endpoints", cmd.IncarnationID)
+			}
 			return nil
 		}
 		if !existing.Fenced || brokerInActivePartition(f.state.Partitions, cmd.ID) {
@@ -212,9 +233,58 @@ func (f *ControllerFSM) applyRegisterBroker(payload json.RawMessage, logIndex ui
 		ID:            cmd.ID,
 		IncarnationID: cmd.IncarnationID,
 		BrokerEpoch:   logIndex,
+		Endpoints:     endpoints,
 		Fenced:        true,
 	}
 	return nil
+}
+
+func normalizeEndpoints(endpoints []BrokerEndpoint) ([]BrokerEndpoint, error) {
+	if len(endpoints) == 0 {
+		return nil, fmt.Errorf("at least one endpoint required")
+	}
+
+	out := append([]BrokerEndpoint(nil), endpoints...)
+	seen := make(map[string]bool, len(endpoints))
+	for i := range out {
+		out[i].Name = strings.ToUpper(strings.TrimSpace(out[i].Name))
+		out[i].Host = strings.TrimSpace(out[i].Host)
+		e := out[i]
+		if e.Name == "" {
+			return nil, fmt.Errorf("endpoint name required")
+		}
+		if e.Host == "" {
+			return nil, fmt.Errorf("endpoint %q: host required", e.Name)
+		}
+		if e.Port == 0 {
+			return nil, fmt.Errorf("endpoint %q: port required", e.Name)
+		}
+		if e.SecurityProtocol != SecurityProtocolPlaintext {
+			return nil, fmt.Errorf("endpoint %q: unsupported security protocol %d", e.Name, e.SecurityProtocol)
+		}
+		if seen[e.Name] {
+			return nil, fmt.Errorf("duplicate endpoint name %q", e.Name)
+		}
+		seen[e.Name] = true
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out, nil
+}
+
+func endpointsEqual(a, b []BrokerEndpoint) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	left := append([]BrokerEndpoint(nil), a...)
+	right := append([]BrokerEndpoint(nil), b...)
+	sort.Slice(left, func(i, j int) bool { return left[i].Name < left[j].Name })
+	sort.Slice(right, func(i, j int) bool { return right[i].Name < right[j].Name })
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func (f *ControllerFSM) applyUnfenceBroker(payload json.RawMessage) error {
@@ -391,7 +461,40 @@ func (f *ControllerFSM) GetBroker(id int32) (BrokerInfo, bool) {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 	b, ok := f.state.Brokers[id]
-	return b, ok
+	if !ok {
+		return BrokerInfo{}, false
+	}
+	b.Endpoints = append([]BrokerEndpoint(nil), b.Endpoints...)
+	return b, true
+}
+
+// AllBrokers returns defensive copies of registered brokers.
+func (f *ControllerFSM) AllBrokers() []BrokerInfo {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	out := make([]BrokerInfo, 0, len(f.state.Brokers))
+	for _, b := range f.state.Brokers {
+		cp := b
+		cp.Endpoints = append([]BrokerEndpoint(nil), b.Endpoints...)
+		out = append(out, cp)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
+}
+
+// GetPartitionMetadata returns a flattened partition view.
+func (f *ControllerFSM) GetPartitionMetadata(topic string, partition int32) (PartitionMetadata, bool) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	p, ok := f.state.Partitions[TopicPartitionKey{Topic: topic, Partition: partition}]
+	if !ok {
+		return PartitionMetadata{}, false
+	}
+	return PartitionMetadata{
+		Topic: topic, Partition: partition,
+		LeaderBrokerID: p.LeaderBrokerID, LeaderEpoch: p.LeaderEpoch, PartitionEpoch: p.PartitionEpoch,
+		Replicas: append([]int32(nil), p.Replicas...), ISR: append([]int32(nil), p.ISR...),
+	}, true
 }
 
 // GetPartition returns a defensive copy.
@@ -408,14 +511,72 @@ func (f *ControllerFSM) GetPartition(topic string, partition int32) (PartitionSt
 	return cp, true
 }
 
-// CurrentSnapshotVersion is the current snapshot format.
-const CurrentSnapshotVersion = 1
+// PartitionMetadata is a broker-facing partition view.
+type PartitionMetadata struct {
+	Topic          string
+	Partition      int32
+	LeaderBrokerID int32
+	LeaderEpoch    int32
+	PartitionEpoch int32
+	Replicas       []int32
+	ISR            []int32
+}
+
+// AllPartitions returns defensive copies of all partition metadata.
+func (f *ControllerFSM) AllPartitions() []PartitionMetadata {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+
+	out := make([]PartitionMetadata, 0, len(f.state.Partitions))
+	for key, p := range f.state.Partitions {
+		out = append(out, partitionMetadata(key, p))
+	}
+	sortPartitionMetadata(out)
+	return out
+}
+
+// PartitionsForBroker returns partitions assigned to brokerID.
+func (f *ControllerFSM) PartitionsForBroker(brokerID int32) []PartitionMetadata {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+
+	var out []PartitionMetadata
+	for key, p := range f.state.Partitions {
+		if !containsInt32(p.Replicas, brokerID) {
+			continue
+		}
+		out = append(out, partitionMetadata(key, p))
+	}
+	sortPartitionMetadata(out)
+	return out
+}
+
+func partitionMetadata(key TopicPartitionKey, p PartitionState) PartitionMetadata {
+	return PartitionMetadata{
+		Topic: key.Topic, Partition: key.Partition,
+		LeaderBrokerID: p.LeaderBrokerID, LeaderEpoch: p.LeaderEpoch, PartitionEpoch: p.PartitionEpoch,
+		Replicas: append([]int32(nil), p.Replicas...), ISR: append([]int32(nil), p.ISR...),
+	}
+}
+
+func sortPartitionMetadata(partitions []PartitionMetadata) {
+	sort.Slice(partitions, func(i, j int) bool {
+		if partitions[i].Topic != partitions[j].Topic {
+			return partitions[i].Topic < partitions[j].Topic
+		}
+		return partitions[i].Partition < partitions[j].Partition
+	})
+}
+
+// CurrentSnapshotVersion includes broker endpoints.
+const CurrentSnapshotVersion = 2
 
 type snapshotBroker struct {
-	ID            int32  `json:"id"`
-	IncarnationID string `json:"incarnation_id"`
-	BrokerEpoch   uint64 `json:"broker_epoch"`
-	Fenced        bool   `json:"fenced"`
+	ID            int32            `json:"id"`
+	IncarnationID string           `json:"incarnation_id"`
+	BrokerEpoch   uint64           `json:"broker_epoch"`
+	Endpoints     []BrokerEndpoint `json:"endpoints"`
+	Fenced        bool             `json:"fenced"`
 }
 
 type snapshotTopic struct {
@@ -522,7 +683,8 @@ func toSnapshotData(s controllerState) snapshotData {
 	brokers := make([]snapshotBroker, 0, len(s.Brokers))
 	for _, b := range s.Brokers {
 		brokers = append(brokers, snapshotBroker{
-			ID: b.ID, IncarnationID: b.IncarnationID, BrokerEpoch: b.BrokerEpoch, Fenced: b.Fenced,
+			ID: b.ID, IncarnationID: b.IncarnationID, BrokerEpoch: b.BrokerEpoch,
+			Endpoints: append([]BrokerEndpoint(nil), b.Endpoints...), Fenced: b.Fenced,
 		})
 	}
 	sort.Slice(brokers, func(i, j int) bool { return brokers[i].ID < brokers[j].ID })
@@ -568,10 +730,17 @@ func fromSnapshotData(data snapshotData) (controllerState, error) {
 		if b.BrokerEpoch == 0 {
 			return controllerState{}, fmt.Errorf("broker %d: invalid broker epoch 0", b.ID)
 		}
+		endpoints, err := normalizeEndpoints(b.Endpoints)
+		if err != nil {
+			return controllerState{}, fmt.Errorf("broker %d: %w", b.ID, err)
+		}
 		if _, exists := out.Brokers[b.ID]; exists {
 			return controllerState{}, fmt.Errorf("duplicate broker %d", b.ID)
 		}
-		out.Brokers[b.ID] = BrokerInfo{ID: b.ID, IncarnationID: b.IncarnationID, BrokerEpoch: b.BrokerEpoch, Fenced: b.Fenced}
+		out.Brokers[b.ID] = BrokerInfo{
+			ID: b.ID, IncarnationID: b.IncarnationID, BrokerEpoch: b.BrokerEpoch,
+			Endpoints: endpoints, Fenced: b.Fenced,
+		}
 	}
 
 	for _, t := range data.Topics {

@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/berkaydemircin/Distributed-Messaging-System/internal/controller"
 	"github.com/berkaydemircin/Distributed-Messaging-System/internal/log"
 )
 
@@ -48,7 +49,7 @@ func NewTopicManager(dataDir string, localBrokerID int32, logConfig log.LogConfi
 	return tm, nil
 }
 
-// WARNING this assumes a single node and automatically promotes to leader
+// recoverFromDisk opens local logs without assigning partition roles.
 func (tm *TopicManager) recoverFromDisk() error {
 	entries, err := os.ReadDir(tm.dataDir)
 	if err != nil {
@@ -107,27 +108,6 @@ func (tm *TopicManager) recoverFromDisk() error {
 				continue
 			}
 			p := NewPartition(topicName, int32(d.id), tm.localBrokerID, l)
-
-			epoch, ok := l.LatestLeaderEpoch()
-			if !ok {
-				epoch = 1
-			}
-
-			if err := p.MakeLeader(
-				epoch,
-				[]int32{tm.localBrokerID},
-				l.NextOffset(),
-			); err != nil {
-				fmt.Printf(
-					"warn: partition %s-%d offline on recovery: MakeLeader: %v\n",
-					topicName,
-					d.id,
-					err,
-				)
-				_ = p.Close()
-				continue
-			}
-
 			partitions[d.id] = p
 		}
 
@@ -135,6 +115,87 @@ func (tm *TopicManager) recoverFromDisk() error {
 	}
 
 	return nil
+}
+
+func (tm *TopicManager) Reconcile(ctrl Controller, brokerID int32) error {
+	assignments := ctrl.PartitionsForBroker(brokerID)
+	desired := make(map[topicPartitionKey]controller.PartitionMetadata, len(assignments))
+	for _, pm := range assignments {
+		desired[topicPartitionKey{topic: pm.Topic, partition: pm.Partition}] = pm
+	}
+
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+
+	// Retain local data for removed replicas but stop serving
+	for topic, t := range tm.topics {
+		for partition, p := range t.partitions {
+			if p == nil {
+				continue
+			}
+			key := topicPartitionKey{topic: topic, partition: int32(partition)}
+			if _, ok := desired[key]; !ok {
+				leaderID, _, isLeader := p.Assignment()
+				if isLeader || leaderID >= 0 {
+					p.MakeUnassigned()
+				}
+			}
+		}
+	}
+
+	for _, pm := range assignments {
+		t, ok := tm.topics[pm.Topic]
+		if !ok {
+			t = &Topic{name: pm.Topic}
+			tm.topics[pm.Topic] = t
+		}
+		if int(pm.Partition) >= len(t.partitions) {
+			grown := make([]*Partition, pm.Partition+1)
+			copy(grown, t.partitions)
+			t.partitions = grown
+		}
+
+		p := t.partitions[pm.Partition]
+		if p == nil {
+			partDir := tm.partitionDir(pm.Topic, int(pm.Partition))
+			l, err := log.NewLog(partDir, tm.logConfig)
+			if err != nil {
+				return fmt.Errorf("reconcile %s-%d: open log: %w", pm.Topic, pm.Partition, err)
+			}
+			p = NewPartition(pm.Topic, pm.Partition, brokerID, l)
+			t.partitions[pm.Partition] = p
+		}
+
+		leaderID, epoch, isLeader := p.Assignment()
+		if pm.LeaderBrokerID == brokerID {
+			if isLeader && leaderID == brokerID && epoch == pm.LeaderEpoch {
+				if !equalInt32s(p.ISRSnapshot(), pm.ISR) {
+					if err := p.UpdateLeaderISR(pm.LeaderEpoch, pm.ISR); err != nil {
+						return fmt.Errorf("reconcile %s-%d: update ISR: %w", pm.Topic, pm.Partition, err)
+					}
+				}
+				continue
+			}
+			if err := p.MakeLeader(pm.LeaderEpoch, pm.ISR, p.HighWatermark()); err != nil {
+				return fmt.Errorf("reconcile %s-%d: MakeLeader: %w", pm.Topic, pm.Partition, err)
+			}
+		} else if isLeader || leaderID != pm.LeaderBrokerID || epoch != pm.LeaderEpoch {
+			p.MakeFollower(pm.LeaderEpoch, pm.LeaderBrokerID)
+		}
+	}
+	return nil
+}
+
+func equalInt32s(a, b []int32) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func (tm *TopicManager) CreateTopic(name string, numPartitions int, initialLeader bool) error {
@@ -196,8 +257,8 @@ func (tm *TopicManager) CreateTopic(name string, numPartitions int, initialLeade
 
 func (tm *TopicManager) GetPartition(topic string, partitionID int32) (*Partition, ErrorCode) {
 	tm.mu.RLock()
+	defer tm.mu.RUnlock()
 	t, ok := tm.topics[topic]
-	tm.mu.RUnlock()
 
 	if !ok {
 		return nil, ErrUnknownTopicOrPartition
@@ -270,8 +331,8 @@ func (tm *TopicManager) TopicNames() []string {
 
 func (tm *TopicManager) PartitionCount(topic string) (int, ErrorCode) {
 	tm.mu.RLock()
+	defer tm.mu.RUnlock()
 	t, ok := tm.topics[topic]
-	tm.mu.RUnlock()
 	if !ok {
 		return 0, ErrUnknownTopicOrPartition
 	}

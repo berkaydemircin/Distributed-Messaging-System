@@ -12,6 +12,8 @@ type BrokerConfig struct {
 	LogDir          string
 	LogConfig       log.LogConfig
 	MaxRequestBytes int32
+
+	Controller Controller
 }
 
 func applyBrokerDefaults(c *BrokerConfig) {

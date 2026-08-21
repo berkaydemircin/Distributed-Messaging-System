@@ -5,27 +5,31 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
 	"time"
 
+	"github.com/berkaydemircin/Distributed-Messaging-System/internal/controller"
 	"github.com/berkaydemircin/Distributed-Messaging-System/internal/protocol"
 	"github.com/berkaydemircin/Distributed-Messaging-System/internal/server"
 )
 
 type Handler struct {
-	topics   *TopicManager
-	brokerID int32
-	host     string
-	port     int32
-	logger   *slog.Logger
+	topics     *TopicManager
+	brokerID   int32
+	host       string
+	port       int32
+	logger     *slog.Logger
+	controller Controller // nil in standalone mode
 }
 
-func NewHandler(topics *TopicManager, brokerID int32, host string, port int32, logger *slog.Logger) *Handler {
+func NewHandler(topics *TopicManager, brokerID int32, host string, port int32, logger *slog.Logger, ctrl Controller) *Handler {
 	return &Handler{
-		topics:   topics,
-		brokerID: brokerID,
-		host:     host,
-		port:     port,
-		logger:   logger,
+		topics:     topics,
+		brokerID:   brokerID,
+		host:       host,
+		port:       port,
+		logger:     logger,
+		controller: ctrl,
 	}
 }
 
@@ -363,11 +367,14 @@ func (h *Handler) handleMetadata(header protocol.RequestHeader, body []byte) (se
 		return nil, fmt.Errorf("decode metadata v%d: %w", v, err)
 	}
 
+	if h.controller != nil {
+		resp := metadataResponseFromController(h.controller, req)
+		return server.BytesResponse(protocol.EncodeMetadataResponse(resp, v)), nil
+	}
+
 	resp := &protocol.MetadataResponse{
-		Brokers: []protocol.MetadataBroker{
-			{NodeID: h.brokerID, Host: h.host, Port: h.port},
-		},
-		ControllerID: h.brokerID, // TODO assuming single-node: we are always the controller
+		Brokers:      []protocol.MetadataBroker{{NodeID: h.brokerID, Host: h.host, Port: h.port}},
+		ControllerID: h.brokerID,
 	}
 
 	var topicNames []string
@@ -423,6 +430,66 @@ func (h *Handler) handleMetadata(header protocol.RequestHeader, body []byte) (se
 	}
 
 	return server.BytesResponse(protocol.EncodeMetadataResponse(resp, v)), nil
+}
+
+func metadataResponseFromController(ctrl Controller, req *protocol.MetadataRequest) *protocol.MetadataResponse {
+	resp := &protocol.MetadataResponse{
+		ControllerID: -1,
+		Brokers:      metadataBrokersFromController(ctrl),
+	}
+
+	byTopic := make(map[string][]controller.PartitionMetadata)
+	for _, partition := range ctrl.AllPartitions() {
+		byTopic[partition.Topic] = append(byTopic[partition.Topic], partition)
+	}
+
+	topicNames := req.Topics
+	if req.AllTopics {
+		topicNames = make([]string, 0, len(byTopic))
+		for topic := range byTopic {
+			topicNames = append(topicNames, topic)
+		}
+		sort.Strings(topicNames)
+	}
+
+	resp.Topics = make([]protocol.MetadataTopicResponse, len(topicNames))
+	for i, topic := range topicNames {
+		topicResp := &resp.Topics[i]
+		topicResp.Name = topic
+		partitions, ok := byTopic[topic]
+		if !ok {
+			topicResp.ErrorCode = int16(ErrUnknownTopicOrPartition)
+			continue
+		}
+		sort.Slice(partitions, func(i, j int) bool { return partitions[i].Partition < partitions[j].Partition })
+		topicResp.Partitions = make([]protocol.MetadataPartitionResponse, len(partitions))
+		for j, partition := range partitions {
+			topicResp.Partitions[j] = protocol.MetadataPartitionResponse{
+				PartitionIndex: partition.Partition,
+				LeaderID:       partition.LeaderBrokerID,
+				LeaderEpoch:    partition.LeaderEpoch,
+				ReplicaNodes:   append([]int32(nil), partition.Replicas...),
+				ISRNodes:       append([]int32(nil), partition.ISR...),
+			}
+		}
+	}
+	return resp
+}
+
+func metadataBrokersFromController(ctrl Controller) []protocol.MetadataBroker {
+	all := ctrl.AllBrokers()
+	out := make([]protocol.MetadataBroker, 0, len(all))
+	for _, b := range all {
+		if b.Fenced {
+			continue
+		}
+		ep, ok := plaintextEndpoint(b.Endpoints)
+		if ok {
+			out = append(out, protocol.MetadataBroker{NodeID: b.ID, Host: ep.Host, Port: int32(ep.Port)})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].NodeID < out[j].NodeID })
+	return out
 }
 
 // TODO header is redundant for now, will implement more fine grained error later
