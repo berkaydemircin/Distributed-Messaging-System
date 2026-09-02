@@ -1,6 +1,6 @@
 # Distributed Messaging System
 
-A Kafka compatible message broker written in Go. This project uses Kafka's wire protocol, so existing Kafka clients such as kcat can communicate with the broker without a custom client library. It is currently aimed to be primarily a learning project for exploring how to design an append only storage and distributed systems. However I've made real optimizations, including with profilers and have achieved pretty decent benchmark results, which will be published here along with a more detailed look once everything is done.
+A Kafka compatible message broker written in Go. It uses Kafka's wire protocol so existing clients such as kcat can produce and fetch records without a custom client library. The project explores append only storage, broker replication and metadata coordination, with performance profiling and benchmarking of the standalone broker.
 
 ## Current state
 
@@ -79,6 +79,17 @@ Expected output:
 2:third
 ```
 
+## Initial write benchmark
+
+On a single standalone broker, the Kafka producer performance tool reported the following results for 100 byte records (`acks=1`, no compression or idempotency):
+
+| Workload | Ingest throughput | Producer p99 latency |
+| --- | ---: | ---: |
+| One producer, one partition | 2.41M records/s (median of three runs) | 1 ms |
+| Four producers, four partitions | 8.00–8.15M records/s (aggregate, two runs) | 1 ms per producer |
+
+These runs used commit `3f74c89`, a GCP `c4-standard-48-lssd` broker and a separate `c4-highcpu-24` producer VM, with 50M records per single producer run and 100M total per four producer run. The latency is measured by the producer through acknowledgment at millisecond resolution. These short runs can be served by the OS page cache so they do not measure consumer throughput, replication yet. More sophisticated tests and benchmarks will be added soon.
+
 ## Tests
 
 I've not committed the tests yet, they will be on the repository in a few weeks once the project core is finished.
@@ -95,4 +106,4 @@ The test suite covers the storage format, epoch recovery, truncation, long polli
 
 This is not a complete Kafka implementation. Consumer groups, transactions, idempotent producers, administrative topic APIs, SASL and TLS are not implemented yet. The project is not intended for production use ( atleast yet :) ).
 
-More detailed architecture, correctness and benchmark documentation will be added soon.
+More detailed architecture and correctness documentation will be added as the project develops.
